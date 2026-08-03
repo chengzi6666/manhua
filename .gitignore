@@ -1,0 +1,73 @@
+# ===== Environment & secrets (NEVER commit) =====
+.env
+.env.local
+
+# ===== Python caches =====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.trae/
+
+# ===== Runtime models & caches (downloaded automatically at runtime) =====
+.u2net_cache/
+models/
+
+# ===== Runtime data & logs (regenerated at runtime; ephemeral on Railway) =====
+data/
+*.log
+app_debug.log
+flask*.log
+nul
+
+# ===== Backups & dev/test junk =====
+app.py.bak*
+*.bak_*
+_qa_*
+_qa_*.py
+_qa_*.json
+_qa_*.png
+_test_*.py
+_test_*.png
+_test_agg_dict.png
+_smoke_*.png
+_tmp_*.py
+_tmp_prompt_check.py
+_check_sizes.py
+_prompt_test.py
+_pollinations_smoke2.py
+_verify_*.py
+qa_*
+qa_bubble_tmp/
+qa_ffrep*/
+_qa_tmp/
+deliverables/
+bubble-review.html
+generate_bubbles.py
+DESIGN.md
+
+# ===== Static runtime / junk (excluded; essentials added explicitly) =====
+static/output/
+static/uploads/
+static/poses_backup_*/
+static/_qa_test/
+static/poses/_original/
+static/poses/sprite/_check/
+*.bak
+*_BAK.png
+*_oldBAK.png
+*_old.png
+*_watermarked.png
+templates/_syntax_check_temp.js
+
+# ===== extra dev/test artifacts (left untracked on purpose) =====
+prompts/
+recolor_neutral_bubbles.py
+replace_bubbles.py
+restart_flask.sh
+start_app.py
+test_*.py
+test_*.pptx
+test_*.zip
+test_ark_image.py
+test_comic_layout.py
