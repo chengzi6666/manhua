@@ -1,0 +1,17 @@
+# 部署镜像构建时排除（避免把开发产物/大体积生成目录打进镜像）
+.git
+.env
+*.bak
+*.bak_*
+static/output
+static/uploads
+.u2net_cache
+data
+__pycache__
+*.pyc
+models
+prompts
+test_*.py
+start_app.py
+verify_*.py
+*.md

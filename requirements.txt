@@ -1,3 +1,10 @@
+# ============================================================
+# 大阅读精灵漫画家 - 部署依赖
+# 说明：背景生成/生图已走火山(Volcengine Ark) API，不依赖本地模型。
+#       以下"必需"为轻量包，任何「上传即部署」的 PaaS 都能直接跑。
+# ============================================================
+
+# ===== 部署必需（轻量）=====
 Flask==2.3.3
 Pillow==10.0.0
 requests==2.31.0
@@ -5,15 +12,21 @@ gunicorn==21.2.0
 PyPDF2==3.0.1
 python-dotenv==1.0.0
 werkzeug==2.3.7
-pytesseract==0.3.10
-PyMuPDF==1.24.3
-easyocr==1.7.2
-python-pptx==1.0.2
 flask-cors==4.0.0
 python-docx==1.1.0
-rapidocr_pdf>=0.4.0
-rapidocr_onnxruntime>=1.2.0
+python-pptx==1.0.2
+PyMuPDF==1.24.3
+pytesseract==0.3.10
 pdf_oxide>=0.3.0
-onnxruntime>=1.15.0
-opencv-python>=4.5.0
-rembg>=2.0.0
+
+# ===== 可选重依赖（抠图/OCR 增强，按需安装；不装自动降级）=====
+# 不装时：
+#   - 人物抠图(rembg)   -> 自动回退「颜色阈值去底」
+#   - 文字识别(easyocr/rapidocr) -> 自动回退「火山 doubao OCR」
+# 若要最高质量抠图/OCR，在「大规格」实例上再 pip install 下面这组：
+# easyocr==1.7.2
+# rembg>=2.0.0
+# onnxruntime>=1.15.0
+# opencv-python>=4.5.0
+# rapidocr_pdf>=0.4.0
+# rapidocr_onnxruntime>=1.2.0
