@@ -3,6 +3,7 @@ FROM python:3.12-slim
 # 系统依赖：PyMuPDF / pdf_oxide / Pillow 需要的基础库
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 tesseract-ocr \
+    fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

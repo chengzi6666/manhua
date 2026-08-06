@@ -4288,9 +4288,15 @@ def get_font_path(font_family):
     
     fallback_paths = [
         'C:/Windows/Fonts/msyh.ttc',
+        'C:/Windows/Fonts/msyhbd.ttc',
         '/System/Library/Fonts/STHeiti Light.ttc',
         '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
-        '/usr/share/fonts/truetype/noto/NotoSansCJK-SC.ttc'
+        '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
+        '/usr/share/fonts/truetype/noto/NotoSansCJK-SC.ttc',
+        '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc',
+        '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc'
     ]
     
     for path in fallback_paths:
@@ -12691,6 +12697,13 @@ def api_generate_comic_from_script():
                 'bubbles': [],
                 'sound_effect': None
             }
+
+            # 合成失败时直接返回错误，避免返回不存在的图片 URL
+            if not panel_meta.get('success', False):
+                error_msg = panel_meta.get('error', '未知合成错误')
+                logger.error(f"分镜{i+1}合成失败: {error_msg}")
+                return jsonify({'error': f'分镜{i+1}合成失败: {error_msg}'}), 500
+
             panel_meta['url'] = f'/static/output/{output_filename}'
             panel_meta['background_url'] = bg_url_used
             panel_meta['index'] = i
