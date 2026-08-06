@@ -16,5 +16,6 @@ ENV PORT=5000
 EXPOSE 5000
 
 # 单 worker：app 持有内存态 + sqlite，多进程会串号
-# 注意：必须用 shell 形式，JSON 数组不会展开 $PORT 环境变量
-CMD gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+# 必须显式 sh -c 包裹：Railway 容器运行时不会自动展开 $PORT，
+# 直接 CMD gunicorn ... 会把字面量 "$PORT" 传给 gunicorn 导致 healthcheck 失败
+CMD ["sh", "-c", "gunicorn app:app --bind 0.0.0.0:${PORT:-3000} --workers 1 --timeout 120"]
