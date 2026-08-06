@@ -15,3 +15,6 @@ test_*.py
 start_app.py
 verify_*.py
 *.md
+.venv
+venv
+env

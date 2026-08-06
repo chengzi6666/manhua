@@ -16,4 +16,5 @@ ENV PORT=5000
 EXPOSE 5000
 
 # 单 worker：app 持有内存态 + sqlite，多进程会串号
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:${PORT}", "--workers", "1", "--timeout", "120"]
+# 注意：必须用 shell 形式，JSON 数组不会展开 $PORT 环境变量
+CMD gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
