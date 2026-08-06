@@ -4895,24 +4895,25 @@
                     if (target) {
                         if (target.type === 'textbox') {
                             startBubbleEdit(target);
-                        } else if (target.type === 'rect' && target.bubbleRef) {
+                        } else if (target.bubbleRef) {
+                            // 双击气泡底图/边框同样进入文字编辑
                             startBubbleEdit(target.bubbleRef);
                         }
                     }
                 });
 
-                // 修复：简化选中逻辑，避免强制切换导致交互混乱
+                // 修复（Bug4）：点击气泡底图(bubbleBgImg)或边框(borderRect)时，统一重定向到对应的
+                // 文字框(textbox)，使「气泡背景 + 文字」作为整体被选中、拖动、缩放，互不分离。
                 window.editorCanvas.on('before:selection:created', function(options) {
                     const target = options.target;
-                    // 点击 borderRect 时，重定向到对应的 textbox
-                    if (target && target.type === 'rect' && target.bubbleRef) {
+                    if (target && target.bubbleRef) {
                         options.target = target.bubbleRef;
                     }
                 });
 
                 window.editorCanvas.on('before:selection:updated', function(options) {
                     const target = options.selected && options.selected[0];
-                    if (target && target.type === 'rect' && target.bubbleRef) {
+                    if (target && target.bubbleRef) {
                         options.target = target.bubbleRef;
                     }
                 });
@@ -4972,8 +4973,10 @@
                             logicalH = finalPanelSize.height;
                         }
                     }
-                    logicalW = logicalW || img.width;
-                    logicalH = logicalH || img.height;
+                    // 兜底：即便 canvas_width 缺失且背景图读取失败，也使用默认画布尺寸常量，
+                    // 绝不回退为 0，避免编辑画布被压扁/缩小。
+                    logicalW = logicalW || img.width || 1024;
+                    logicalH = logicalH || img.height || 768;
                     window.editorLogicalWidth = logicalW;
                     window.editorLogicalHeight = logicalH;
                     const availableW = Math.max(320, container.clientWidth || 900);
@@ -5010,8 +5013,8 @@
                                 const legacyDarkBubble = legacyFill &&
                                     (0.299 * legacyFill[0] + 0.587 * legacyFill[1] + 0.114 * legacyFill[2] < 140);
                                 const fallbackTextColor = legacyDarkBubble ? '#ffffff' : '#333333';
-                                const fallbackStrokeColor = legacyDarkBubble ? '#000000' : '#ffffff';
-                                const fallbackStrokeWidth = Math.max(1, Math.round((b.fontSize || b.font_size || 18) / 12));
+                                const fallbackStrokeColor = 'transparent';
+                                const fallbackStrokeWidth = 0;
                                 // 兼容后端元数据：bubble_url / fill_color / outline_color
                                 // 兼容编辑器保存数据：bubbleImage / backgroundColor / borderColor
                                 const opts = {
@@ -5362,8 +5365,11 @@
             if (bubbleImage) {
                 fabric.Image.fromURL(bubbleImage, function(bgImg) {
                     bgImg.set({
-                        selectable: false,
-                        evented: false,
+                        // 修复（Bug4）：设为可选+可响应事件，使点击气泡底图也能命中并选中其关联
+                        // 文字框，配合 before:selection 重定向，实现「气泡背景+文字」整体拖动/缩放。
+                        // 锁定位/缩放/旋转，避免底图被单独变换而脱离文字。
+                        selectable: true,
+                        evented: true,
                         hasControls: false,
                         hasBorders: false,
                         lockMovementX: true, lockMovementY: true,
@@ -5395,6 +5401,7 @@
                     };
                     bubble.on('moving', syncBg);
                     bubble.on('scaling', syncBg);
+                    bubble.on('rotating', syncBg);
                     bubble.on('modified', syncBg);
                     syncBg();
                 }, { crossOrigin: 'anonymous' });
@@ -5409,8 +5416,10 @@
                 fill: 'transparent',
                 stroke: bubbleImage ? 'transparent' : (opts.borderColor || '#4A90D9'),
                 strokeWidth: bubbleImage ? 0 : (opts.borderWidth || 2),
-                selectable: false,
-                evented: false,
+                // 修复（Bug4）：设为可选+可响应，配合 before:selection 重定向到文字框，
+                // 使边框也作为整体的一部分被选中/拖动/缩放。
+                selectable: true,
+                evented: true,
                 hasControls: false,
                 hasBorders: false,
                 rx: radius + 3,
@@ -5868,7 +5877,10 @@
                             
                             // 修复：直接重新渲染整个预览，确保更新生效
                             renderComicPreview();
-                            
+                            // 修复（Bug1）：编辑保存成功后自动持久化到当前任务，
+                            // 不再需要手动再点【保存为任务】，且侧栏更新已有条目而非新增。
+                            autoSaveCurrentTask();
+
                             closeEditor();
                             showSuccess('✅ 面板编辑已保存并应用！');
                         } else {
@@ -6342,9 +6354,17 @@
         // 冗余记录该任务当前归属的「节」，便于换设备/清缓存后恢复分组
         taskSectionId:(typeof getTaskSectionIdOf==='function'?getTaskSectionIdOf(currentTaskId):null)
       };
-      const res=await TaskAPI.create(title,snapshot);
-      if(res.success){ currentTaskId=res.task&&res.task.id; showSuccess('任务已保存：'+title); await loadTasks(); }
-      else { showError(res.error||'保存失败'); }
+      // 修复（Bug1）：若已绑定到某个任务（打开/生成/上次保存），则「更新」而非「新建」，
+      // 从而避免侧栏出现重复任务。
+      let res;
+      if(currentTaskId){
+        res=await TaskAPI.update(currentTaskId,{data:snapshot});
+      } else {
+        res=await TaskAPI.create(title,snapshot);
+        if(res.success&&res.task){ currentTaskId=res.task.id; }
+      }
+      if(res&&res.success){ showSuccess('任务已保存：'+title); await loadTasks(); }
+      else { showError((res&&res.error)||'保存失败'); }
     }
 
     // 生成成功后自动保存/更新当前任务到左侧任务栏（已登录才生效）

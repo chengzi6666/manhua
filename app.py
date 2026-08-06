@@ -4782,7 +4782,9 @@ def render_bubble(draw, bubble_x, bubble_y, bubble_width, bubble_height, style='
 
 def bubble_text_colors(bubble_image_path=None, fill_color=None):
     """根据气泡底色自动选择文字和描边颜色，确保可读性。
-    深色气泡 -> 白字黑边；浅色气泡 -> 黑字白边。
+    深色气泡 -> 白字（无描边）；浅色气泡 -> 黑字（无描边）。
+    注：原为浅色气泡返回白色描边，会在文字外围形成一圈白边，编辑器无法单独编辑，
+    现已移除描边（返回 None），由字符本体颜色保证可读性。
     """
     try:
         if bubble_image_path:
@@ -4801,20 +4803,20 @@ def bubble_text_colors(bubble_image_path=None, fill_color=None):
                 if count:
                     avg_lum = total / count
                     if avg_lum < 140:
-                        return (255, 255, 255), (0, 0, 0)
+                        return (255, 255, 255), None
         elif fill_color is not None:
             rgb = fill_color[:3]
             lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
             if lum < 140:
-                return (255, 255, 255), (0, 0, 0)
+                return (255, 255, 255), None
     except Exception as e:
         logger.debug(f"气泡底色亮度分析失败: {e}")
-    return (50, 50, 50), (255, 255, 255)
+    return (50, 50, 50), None
 
 
 def render_text(draw, text, bubble_x, bubble_y, bubble_width, bubble_height, font,
                 line_height, padding=12, align='center', text_color=(50, 50, 50), font_path=None,
-                stroke_fill=(255, 255, 255)):
+                stroke_fill=None):
     text = text.replace('\r', '').strip()
     if not text:
         return None
@@ -4869,8 +4871,11 @@ def render_text(draw, text, bubble_x, bubble_y, bubble_width, bubble_height, fon
         else:
             text_x = bubble_x + (bubble_width - line_width) // 2
 
-        draw.text((text_x, text_y), line, font=current_font, fill=text_color,
-                  stroke_width=stroke_width, stroke_fill=stroke_fill)
+        if stroke_fill is not None:
+            draw.text((text_x, text_y), line, font=current_font, fill=text_color,
+                      stroke_width=stroke_width, stroke_fill=stroke_fill)
+        else:
+            draw.text((text_x, text_y), line, font=current_font, fill=text_color)
         text_y += line_height
 
     # 编辑器需要复用最终实际生效的排版值；长文本可能在这里被缩小，不能只传
@@ -4878,7 +4883,7 @@ def render_text(draw, text, bubble_x, bubble_y, bubble_width, bubble_height, fon
     return {
         'font_size': current_size,
         'line_height': line_height,
-        'stroke_width': stroke_width,
+        'stroke_width': stroke_width if stroke_fill is not None else 0,
     }
 
 
@@ -4935,7 +4940,7 @@ def render_sound_effect(draw, text, x, y, bg_width, bg_height, font_path):
         text_x = cx - text_width // 2
         text_y = cy - text_height // 2
         
-        draw.text((text_x, text_y), text, font=font, fill=(255, 50, 100), stroke_width=2, stroke_fill=(255, 255, 255))
+        draw.text((text_x, text_y), text, font=font, fill=(255, 50, 100))
         
     except Exception as e:
         logger.warning(f"渲染音效文字失败: {str(e)}")
@@ -5257,7 +5262,21 @@ def _wrap_dialogue_lines(draw, text, font, max_width, max_chars_per_line=11):
                     current_line = ""
     if current_line:
         lines.append(current_line)
-    return lines
+
+    # 避头标点：换行后一行不应以"句末标点 / 后括号 / 后引号"开头。
+    # 这类标点应回贴到上一行末尾；若上一行已满（再加会溢出）则保留在行首，
+    # 以保证可读性优先于绝对避头。
+    # 用 while 而非 if：连续多个标点（如 "！"）需逐个回贴，不能只移一个。
+    forbidden_head = set('，。！？、；：”’）】〉》·…—,.!?;:)')
+    fixed = []
+    for idx, line in enumerate(lines):
+        while (idx > 0 and line and len(fixed) > 0 and line[0] in forbidden_head
+                and len(fixed[-1]) < max_chars_per_line):
+            fixed[-1] = fixed[-1] + line[0]
+            line = line[1:]
+        if line:
+            fixed.append(line)
+    return fixed
 
 
 def map_action_to_pose(action):
@@ -6222,13 +6241,27 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
             fill_color = bubble_colors[idx % len(bubble_colors)]
             outline_color = outline_colors[idx % len(outline_colors)]
             
-            # ===== 气泡图来源：三优先级 =====
-            # ① 逐句手动指定 bubble_images[idx] 非空 → 用逐句手动气泡
-            # ② 人物指定 character_bubble_map[current_speaker] 命中且非「自动」→ 用人物指定气泡
-            #    - 若值是 url（以 / 或 http 开头）→ 直接作为气泡图片路径使用
-            #    - 否则当作 emotion key → 调 get_random_bubble_image(value)
+            # ===== 气泡图来源：三优先级（显式人物指定 > 该格气泡 > 默认）=====
+            # ① 人物显式指定 character_bubble_map[current_speaker] 命中且非「自动」→ 用人物指定气泡
+            # ② 该格（panel）逐句手动指定 bubble_images[idx] 非空 → 用该格气泡
             # ③ 否则 → analyze_emotion 自动按语气匹配
             emotion_bubble_path = None
+
+            # 人物气泡：精确匹配当前说话人；并兼容前后端命名/空白差异做一次 trim 兜底
+            _char_bubble_value = None
+            if isinstance(character_bubble_map, dict) and current_speaker:
+                if current_speaker in character_bubble_map:
+                    _char_bubble_value = character_bubble_map.get(current_speaker)
+                else:
+                    _stripped = current_speaker.strip()
+                    for _k, _v in character_bubble_map.items():
+                        if _k is not None and _k.strip() == _stripped:
+                            _char_bubble_value = _v
+                            break
+            _per_character = (
+                _char_bubble_value is not None
+                and _char_bubble_value not in ('auto', '', None)
+            )
 
             _per_dialogue = (
                 bubble_images is not None
@@ -6236,37 +6269,28 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
                 and idx < len(bubble_images)
                 and bool(bubble_images[idx])
             )
-            if _per_dialogue:
+
+            if _per_character:
+                _char_bubble = _char_bubble_value
+                # 值为气泡图片 url（/ 或 http 开头）→ 解析为本地路径；否则当作情绪 key
+                if isinstance(_char_bubble, str) and (
+                    _char_bubble.startswith('/') or _char_bubble.startswith('http')
+                ):
+                    if _char_bubble.startswith('/'):
+                        emotion_bubble_path = os.path.join(
+                            app.root_path, _char_bubble.lstrip('/')
+                        )
+                    else:
+                        # http(s) 远程 url：下载到本地临时文件
+                        emotion_bubble_path = _download_bubble_to_local(_char_bubble)
+                    logger.info(f"[人物气泡] {current_speaker} -> {_char_bubble} (url)")
+                else:
+                    # 值为情绪 key（happy/sad/angry/surprised/neutral/custom）→ 随机取该情绪气泡
+                    emotion_bubble_path = get_random_bubble_image(_char_bubble)
+                    logger.info(f"[人物气泡] {current_speaker} -> {_char_bubble} (emotion)")
+            elif _per_dialogue:
                 emotion_bubble_path = bubble_images[idx]
                 logger.info(f"[逐句气泡] idx={idx} speaker={current_speaker} -> {bubble_images[idx]}")
-
-            elif (isinstance(character_bubble_map, dict)
-                  and current_speaker
-                  and current_speaker in character_bubble_map):
-                _char_bubble = character_bubble_map.get(current_speaker)
-                # 兼容前端可能传 null / 空串 / 'auto'（表示回退自动）
-                if _char_bubble and _char_bubble not in ('auto', '', None):
-                    if isinstance(_char_bubble, str) and (
-                        _char_bubble.startswith('/') or _char_bubble.startswith('http')
-                    ):
-                        # 值为气泡图片 url：解析为本地图片路径
-                        if _char_bubble.startswith('/'):
-                            emotion_bubble_path = os.path.join(
-                                app.root_path, _char_bubble.lstrip('/')
-                            )
-                        else:
-                            # http(s) 远程 url：下载到本地临时文件
-                            emotion_bubble_path = _download_bubble_to_local(_char_bubble)
-                        logger.info(f"[人物气泡] {current_speaker} -> {_char_bubble} (url)")
-                    else:
-                        # 值为情绪 key（happy/sad/angry/surprised/neutral/custom）→ 随机取该情绪气泡
-                        emotion_bubble_path = get_random_bubble_image(_char_bubble)
-                        logger.info(f"[人物气泡] {current_speaker} -> {_char_bubble} (emotion)")
-                else:
-                    # 显式回退到自动情绪
-                    emotion = analyze_emotion(dialogue_text)
-                    emotion_bubble_path = get_random_bubble_image(emotion)
-
             else:
                 emotion = analyze_emotion(dialogue_text)
                 emotion_bubble_path = get_random_bubble_image(emotion)
@@ -6367,7 +6391,7 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
                 'padding': padding,
                 'text_align': text_align,
                 'text_color': list(text_color[:3]),
-                'stroke_fill': list(stroke_fill[:3]),
+                'stroke_fill': list(stroke_fill[:3]) if stroke_fill else None,
                 'stroke_width': text_render_info.get('stroke_width', 0),
                 'rendered_layer_url': bubble_layer_url,
                 'rendered_layer_x': bubble_layer_box[0] if bubble_layer_box else bubble_x,
@@ -13378,4 +13402,5 @@ def api_delete_task(task_id):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"启动Flask应用，端口: {port}")
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    # debug=True 开启 Werkzeug reloader：修改 app.py 或模板后自动重启 Flask 让改动生效
+    app.run(host='0.0.0.0', port=port, debug=True, threaded=True)
