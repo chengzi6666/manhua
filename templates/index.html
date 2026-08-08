@@ -4892,31 +4892,14 @@
 
                 window.editorCanvas.on('mouse:dblclick', function(options) {
                     const target = options.target;
-                    if (target) {
-                        if (target.type === 'textbox') {
-                            startBubbleEdit(target);
-                        } else if (target.bubbleRef) {
-                            // 双击气泡底图/边框同样进入文字编辑
-                            startBubbleEdit(target.bubbleRef);
-                        }
+                    if (target && target.type === 'textbox') {
+                        // 只有文字框双击才编辑文字；气泡底图可独立选择、拖动。
+                        startBubbleEdit(target);
                     }
                 });
 
-                // 修复（Bug4）：点击气泡底图(bubbleBgImg)或边框(borderRect)时，统一重定向到对应的
-                // 文字框(textbox)，使「气泡背景 + 文字」作为整体被选中、拖动、缩放，互不分离。
-                window.editorCanvas.on('before:selection:created', function(options) {
-                    const target = options.target;
-                    if (target && target.bubbleRef) {
-                        options.target = target.bubbleRef;
-                    }
-                });
-
-                window.editorCanvas.on('before:selection:updated', function(options) {
-                    const target = options.selected && options.selected[0];
-                    if (target && target.bubbleRef) {
-                        options.target = target.bubbleRef;
-                    }
-                });
+                // 编辑模式中气泡与文字是两个独立对象：点击/拖动气泡不会再
+                // 自动重定向到文字框，便于分别微调两者的位置。
 
                 // 取证：诊断“无法拖动/选中”——记录每次 mouse:down 的命中目标、坐标、视口变换
                 window.editorCanvas.on('mouse:down', function(opt) {
@@ -5260,7 +5243,6 @@
         function addBubbleToEditor(text, x, y, w, h, opts = {}) {
             // 不要按固定字数二次换行。后端是按真实字体的像素宽度断行，固定 11
             // 个字会让编辑器与预览出现完全不同的行数和字号。
-            const bubbleText = text || '';
             // 修复：无参添加气泡时，按优先级套用样式：① 当前选中的样式预设 ② 当前激活气泡 ③ 默认白底蓝边
             if ((!opts.backgroundColor || opts.backgroundColor === '#ffffff') && !opts.borderColor) {
                 if (window.currentEditorBubbleStyle) {
@@ -5300,13 +5282,26 @@
             const editorLineHeight = opts.lineHeightPx && opts.fontSize
                 ? opts.lineHeightPx / opts.fontSize
                 : 1.16;
+            // 11 字是上限，不是强制把 11 个粗体汉字塞进任意窄气泡。先依据
+            // 实际可用宽度计算本气泡一行真正能放下的字数，取两者较小值。
+            // 这样旧任务双击转为 Fabric 文本后不会再越出气泡边缘。
+            const textAreaWidth = exactPreviewLayout
+                ? Math.max(12, (w || 200) - editorPadding * 2)
+                : (w || 200);
+            const maxCharsByWidth = Math.max(1, Math.floor(
+                textAreaWidth / Math.max(1, editorFontSize * 1.04)
+            ));
+            const bubbleText = autoWrapDialogue(text || '', Math.min(11, maxCharsByWidth));
             
             const bubble = new fabric.Textbox(bubbleText || '双击编辑文字', {
                 left: exactPreviewLayout ? ((x || 0) + editorPadding) : (x || 50),
                 top: exactPreviewLayout ? ((y || 0) + editorPadding) : (y || 50),
                 // Fabric 的 width 不含 padding；此前传入整块气泡宽度后又加 padding，
                 // 文字实际可用区域比预览更宽并溢出到相邻气泡。
-                width: exactPreviewLayout ? Math.max(12, (w || 200) - editorPadding * 2) : (w || 200),
+                width: textAreaWidth,
+                // Fabric 默认仅在空格处断词；中文没有空格，11 个较宽的粗体字仍会
+                // 冲出气泡。逐字折行后同时满足“最多 11 字/行”和气泡实际宽度。
+                splitByGrapheme: true,
                 fontSize: editorFontSize,
                 lineHeight: editorLineHeight,
                 textAlign: opts.textAlign || 'left',
@@ -5352,6 +5347,7 @@
             bubble.logicalFontSize = opts.fontSize || 18;
             bubble.logicalPadding = opts.padding !== undefined ? opts.padding : 10;
             bubble.sourceFontFamily = opts.fontFamily || bubble.fontFamily;
+            bubble.maxCharsPerLine = Math.min(11, maxCharsByWidth);
             if (exactPreviewLayout && bubble.previewBoxHeight) {
                 // Pillow 预览在气泡内垂直居中；Fabric Textbox 不会自动做该计算。
                 bubble.top = (y || 0) + Math.max(editorPadding,
@@ -5365,16 +5361,17 @@
             if (bubbleImage) {
                 fabric.Image.fromURL(bubbleImage, function(bgImg) {
                     bgImg.set({
-                        // 修复（Bug4）：设为可选+可响应事件，使点击气泡底图也能命中并选中其关联
-                        // 文字框，配合 before:selection 重定向，实现「气泡背景+文字」整体拖动/缩放。
-                        // 锁定位/缩放/旋转，避免底图被单独变换而脱离文字。
+                        // 气泡底图本身是独立可编辑对象；文字框与它可以分别拖动。
                         selectable: true,
                         evented: true,
-                        hasControls: false,
-                        hasBorders: false,
-                        lockMovementX: true, lockMovementY: true,
-                        lockScalingX: true, lockScalingY: true,
-                        lockRotation: true
+                        hasControls: true,
+                        hasBorders: true,
+                        cornerColor: '#FF6B6B',
+                        cornerSize: 8,
+                        transparentCorners: false,
+                        lockMovementX: false, lockMovementY: false,
+                        lockScalingX: false, lockScalingY: false,
+                        lockRotation: false
                     });
                     bubble.bubbleBgImg = bgImg;
                     bgImg.bubbleRef = bubble;
@@ -5399,10 +5396,6 @@
                         });
                         window.editorCanvas.renderAll();
                     };
-                    bubble.on('moving', syncBg);
-                    bubble.on('scaling', syncBg);
-                    bubble.on('rotating', syncBg);
-                    bubble.on('modified', syncBg);
                     syncBg();
                 }, { crossOrigin: 'anonymous' });
             }
@@ -5416,12 +5409,19 @@
                 fill: 'transparent',
                 stroke: bubbleImage ? 'transparent' : (opts.borderColor || '#4A90D9'),
                 strokeWidth: bubbleImage ? 0 : (opts.borderWidth || 2),
-                // 修复（Bug4）：设为可选+可响应，配合 before:selection 重定向到文字框，
-                // 使边框也作为整体的一部分被选中/拖动/缩放。
+                // 没有气泡图片时，该边框就是独立可拖动的气泡框。
                 selectable: true,
                 evented: true,
-                hasControls: false,
-                hasBorders: false,
+                hasControls: !bubbleImage,
+                hasBorders: !bubbleImage,
+                cornerColor: '#FF6B6B',
+                cornerSize: 8,
+                transparentCorners: false,
+                lockMovementX: false,
+                lockMovementY: false,
+                lockScalingX: false,
+                lockScalingY: false,
+                lockRotation: false,
                 rx: radius + 3,
                 ry: radius + 3
             });
@@ -5448,10 +5448,7 @@
                 }
             };
 
-            bubble.on('moving', updateBorder);
-            bubble.on('scaling', updateBorder);
-            bubble.on('rotating', updateBorder);
-            bubble.on('modified', updateBorder);
+            // 不同步文字框与气泡边框：它们在编辑模式中需要分别移动。
 
             window.editorCanvas.setActiveObject(bubble);
             window.editorCanvas.renderAll();
@@ -5573,25 +5570,32 @@
             if (obj.type !== 'textbox') return;
             
             const bgColor = document.getElementById('editBgColor').value;
-            const borderColor = document.getElementById('editBorderColor').value;
-            const borderWidth = parseInt(document.getElementById('editBorderWidth').value) || 2;
-            const borderStyle = document.getElementById('editBorderStyle').value;
             
             obj.set({
                 backgroundColor: bgColor,
-                borderColor: borderColor,
-                borderWidth: borderWidth,
                 strokeWidth: 0
             });
             
-            if (obj.borderRef) {
-                obj.borderRef.set({
-                    stroke: borderColor,
-                    strokeWidth: borderWidth
-                });
-            }
-            
             canvas.renderAll();
+        }
+
+        // 点击左侧按钮会让 textarea 失焦；先在 mousedown 阶段记住选中的单字，
+        // 才能在随后 click 阶段安全应用放大样式。
+        function rememberSelectedChar(event) {
+            const input = window.currentEditingInput;
+            const bubble = window.currentEditingBubble;
+            if (input && bubble && input.selectionEnd - input.selectionStart === 1) {
+                window.pendingCharSelection = {
+                    bubble: bubble,
+                    start: input.selectionStart,
+                    end: input.selectionEnd,
+                    text: input.value.slice(input.selectionStart, input.selectionEnd)
+                };
+                event.preventDefault();
+                return false;
+            }
+            window.pendingCharSelection = null;
+            return true;
         }
 
         function setBubbleBgTransparent() {
@@ -5612,6 +5616,50 @@
             });
             canvas.renderAll();
             showSuccess('气泡背景已设为透明');
+        }
+
+        window.charScaleHistory = window.charScaleHistory || [];
+
+        function applySingleCharScale(obj, start, end, selectedText, scale) {
+            const canvas = window.editorCanvas;
+            const styles = obj.getSelectionStyles(start, end) || [{}];
+            const currentStyle = styles[0] || {};
+            const originalSize = Number(currentStyle.originalFontSize) ||
+                Number(currentStyle.fontSize) || obj.fontSize;
+            const previousSize = Number(currentStyle.fontSize) || obj.fontSize;
+            const maxSize = Math.min(originalSize * 20, 360);
+            const newSize = Math.min(originalSize * scale, maxSize);
+
+            // 记录“真正的前一步”，可以连续撤销；倍率 1 永远回到原始字号。
+            window.charScaleHistory.push({
+                obj: obj, start: start, end: end, text: selectedText,
+                previousStyle: { ...currentStyle, fontSize: previousSize },
+                previousSize: previousSize
+            });
+            obj.setSelectionStyles({
+                ...currentStyle,
+                fontSize: newSize,
+                originalFontSize: originalSize
+            }, start, end);
+            obj.initDimensions();
+            canvas.requestRenderAll();
+            showSuccess(scale === 1
+                ? `已将“${selectedText}”恢复为原始字号 ${Math.round(newSize)}px`
+                : `已将“${selectedText}”放大至 ${Math.round(newSize)}px`);
+        }
+
+        function undoLastCharScale() {
+            const canvas = window.editorCanvas;
+            const record = window.charScaleHistory && window.charScaleHistory.pop();
+            if (!canvas || !record || !record.obj || !canvas.getObjects().includes(record.obj)) {
+                showInfo('没有可撤销的单字放大操作');
+                return;
+            }
+            record.obj.setSelectionStyles(record.previousStyle, record.start, record.end);
+            record.obj.initDimensions();
+            canvas.setActiveObject(record.obj);
+            canvas.requestRenderAll();
+            showSuccess(`已撤销“${record.text}”的单字放大`);
         }
 
         function scaleSelectedChar() {
@@ -5637,6 +5685,20 @@
             }
             
             const scale = parseFloat(document.getElementById('editCharScale').value) || 1.5;
+            const pending = window.pendingCharSelection;
+
+            if (pending && pending.bubble === obj && pending.end - pending.start === 1) {
+                // 先提交 textarea 的文字，再按保存下来的选区索引写入单字样式。
+                if (window.currentEditingInput) finishBubbleEdit(true);
+                try {
+                    applySingleCharScale(obj, pending.start, pending.end, pending.text, scale);
+                    window.pendingCharSelection = null;
+                    return;
+                } catch (e) {
+                    console.warn('textarea 单字样式设置失败:', e);
+                    window.pendingCharSelection = null;
+                }
+            }
             
             if (obj.isEditing && obj.selectionStart !== obj.selectionEnd) {
                 const selectedText = obj.text.substring(obj.selectionStart, obj.selectionEnd);
@@ -5644,12 +5706,7 @@
                 if (selectedText.length === 1) {
                     try {
                         if (typeof obj.getSelectionStyles === 'function') {
-                            const currentStyles = obj.getSelectionStyles() || [{}];
-                            const newSize = Math.min(obj.fontSize * scale, 72);
-                            const newStyle = { ...currentStyles[0], fontSize: newSize };
-                            obj.setSelectionStyles([newStyle]);
-                            window.editorCanvas.renderAll();
-                            showSuccess(`已将"${selectedText}"放大至 ${Math.round(newSize)}px`);
+                            applySingleCharScale(obj, obj.selectionStart, obj.selectionEnd, selectedText, scale);
                             return;
                         }
                     } catch(e) {
@@ -5658,7 +5715,7 @@
                 }
             }
             
-            const newSize = Math.min(obj.fontSize * scale, 72);
+            const newSize = Math.min(obj.fontSize * scale, 360);
             obj.set({ fontSize: newSize });
             window.editorCanvas.renderAll();
             showSuccess(`已将整段文字放大至 ${Math.round(newSize)}px`);
@@ -5924,31 +5981,37 @@
             
             const left = rect.left + bubble.left * scaleX;
             const top = rect.top + bubble.top * scaleY;
-            const width = bubble.width * scaleX;
-            const height = bubble.height * scaleY;
+            const width = bubble.getScaledWidth() * scaleX;
+            const height = bubble.getScaledHeight() * scaleY;
             
             const input = document.createElement('textarea');
             input.value = bubble.getText ? bubble.getText() : bubble.text;
-            const padding = bubble.padding * scaleX;
+            const padding = (bubble.padding || 0) * scaleX;
+            const fontSize = bubble.fontSize * (bubble.scaleY || 1) * scaleY;
+            const lineHeight = bubble.lineHeight || 1.16;
+            const strokeWidth = (bubble.strokeWidth || 0) * (bubble.scaleY || 1) * scaleY;
             input.style.cssText = `
                 position: fixed;
                 left: ${left}px;
                 top: ${top}px;
                 width: ${width}px;
                 height: ${height + padding * 2}px;
-                font-size: ${bubble.fontSize * scaleX}px;
+                font-size: ${fontSize}px;
                 font-family: ${bubble.fontFamily};
+                font-weight: ${bubble.fontWeight || 'normal'};
+                font-style: ${bubble.fontStyle || 'normal'};
                 padding: ${padding}px;
                 border: 2px solid #4A90D9;
                 border-radius: 4px;
                 background: rgba(255,255,255,0.98);
-                color: #1a1a1a;
+                color: ${bubble.fill || '#333333'};
+                -webkit-text-stroke: ${strokeWidth}px ${bubble.stroke || 'transparent'};
                 resize: none;
                 outline: none;
                 box-shadow: 0 2px 10px rgba(0,0,0,0.2);
                 z-index: 10000;
                 overflow: auto;
-                line-height: 1.4;
+                line-height: ${lineHeight};
                 box-sizing: border-box;
             `;
             
@@ -5958,6 +6021,18 @@
                     finishBubbleEdit(true);
                 } else if (e.key === 'Escape') {
                     finishBubbleEdit(false);
+                }
+            });
+
+            // 输入时立即维持每行 11 字以内；这样双击后和保存后的内容一致。
+            input.addEventListener('input', function() {
+                const before = this.value;
+                const cursor = this.selectionStart;
+                const wrapped = autoWrapDialogue(before, bubble.maxCharsPerLine || 11);
+                if (wrapped !== before) {
+                    this.value = wrapped;
+                    const nextCursor = Math.min(wrapped.length, cursor + Math.max(0, wrapped.length - before.length));
+                    this.setSelectionRange(nextCursor, nextCursor);
                 }
             });
             
@@ -5978,8 +6053,12 @@
             const canvas = window.editorCanvas;
             
             if (save) {
-                // Bug1 修复：保存/失去焦点时按 11 字/行规则自动重排，保持约束
-                const newText = autoWrapDialogue(window.currentEditingInput.value.trim(), 11);
+                // 保留用户主动换行，同时确保每行最多 11 个字符；后端将直接
+                // 使用这份换行文本重新渲染，因此预览、编辑器与导出保持一致。
+                const newText = autoWrapDialogue(
+                    window.currentEditingInput.value.trim(),
+                    bubble.maxCharsPerLine || 11
+                );
                 if (!newText) {
                     // 文本框被清空：连同边框一起删除该气泡，避免残留空边框
                     if (bubble.borderRef) {
@@ -6116,26 +6195,10 @@
                         <button onclick="setBubbleBgTransparent()" style="width:100%;margin-top:4px;padding:4px;background:#9C27B0;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">设为透明背景</button>
                     </div>
                     <div style="margin-bottom:10px;">
-                        <label style="font-size:12px;color:#666;">边框颜色</label>
-                        <input id="editBorderColor" type="color" value="#4A90D9" style="width:100%;padding:0;height:30px;border:none;border-radius:4px;cursor:pointer;" onchange="updateBubbleStyle()">
-                    </div>
-                    <div style="margin-bottom:10px;">
-                        <label style="font-size:12px;color:#666;">边框宽度</label>
-                        <input id="editBorderWidth" type="number" value="2" min="0" max="10" style="width:100%;padding:4px;" onchange="updateBubbleStyle()">
-                    </div>
-                    <div style="margin-bottom:10px;">
-                        <label style="font-size:12px;color:#666;">边框样式</label>
-                        <select id="editBorderStyle" style="width:100%;padding:4px;" onchange="updateBubbleStyle()">
-                            <option value="solid">实线</option>
-                            <option value="dashed">虚线</option>
-                            <option value="dotted">点线</option>
-                            <option value="double">双线</option>
-                        </select>
-                    </div>
-                    <div style="margin-bottom:10px;">
                         <label style="font-size:12px;color:#666;">单字放大倍数</label>
-                        <input id="editCharScale" type="number" value="1.5" min="1" max="5" step="0.1" style="width:100%;padding:4px;">
-                        <button onclick="scaleSelectedChar()" style="width:100%;margin-top:4px;padding:4px;background:#FF9800;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">应用单字放大</button>
+                        <input id="editCharScale" type="number" value="1.5" min="1" max="20" step="0.1" style="width:100%;padding:4px;">
+                        <button onmousedown="rememberSelectedChar(event)" onclick="scaleSelectedChar()" style="width:100%;margin-top:4px;padding:4px;background:#FF9800;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">应用单字放大</button>
+                        <button onclick="undoLastCharScale()" style="width:100%;margin-top:4px;padding:4px;background:#64748B;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">↩ 撤销上一步单字放大</button>
                     </div>
                     <div style="margin-top:16px;border-top:1px solid #ddd;padding-top:12px;">
                         <div style="font-size:12px;color:#666;margin-bottom:6px;">气泡列表</div>
@@ -6289,10 +6352,10 @@
       const t=allTasks.find(x=>x.id===id);
       if(!t){ return; }
       currentTaskId=id;   // 绑定到打开的任务，重新生成时更新而非新建
-      await restoreTask(t.data);
+      await restoreTask(t.data, t.title);
       showSuccess('已打开任务：'+t.title);
     }
-    async function restoreTask(data){
+    async function restoreTask(data, taskTitle=''){
       if(!data){ return; }
       currentScript = data.currentScript || null;
       generatedCharacters = data.generatedCharacters || {};
@@ -6306,7 +6369,11 @@
       if(data.taskSectionId && typeof adoptTaskSectionId==='function'){
         adoptTaskSectionId(currentTaskId, data.taskSectionId);
       }
-      if(data.comicTitle!==undefined){ const ct=document.getElementById('comicTitle'); if(ct) ct.value=data.comicTitle; }
+      // 旧任务可能只保存了数据库标题；新任务则优先使用快照中的漫画标题。
+      // 先缓存，等 goToStep4 完成后再写回，避免步骤渲染重置输入框。
+      const restoredTitle = (typeof data.comicTitle === 'string' && data.comicTitle.trim())
+        ? data.comicTitle.trim()
+        : ((taskTitle || (currentScript && currentScript.title) || '').trim());
       if(currentScript){
         const cf=document.getElementById('characterForms'); if(cf) cf.innerHTML='';
         const pf=document.getElementById('panelForms'); if(pf) pf.innerHTML='';
@@ -6319,6 +6386,7 @@
       }
       renderComicPreview();
       if(typeof goToStep4==='function'){ await goToStep4(); }
+      if(restoredTitle){ const ct=document.getElementById('comicTitle'); if(ct) ct.value=restoredTitle; }
       if(Array.isArray(data.layoutPrompts)){
         data.layoutPrompts.forEach((p,i)=>{ const el=document.getElementById('layoutPrompt'+i); if(el) el.value=p; });
       }
@@ -6342,7 +6410,7 @@
       const ct=document.getElementById('comicTitle');
       const title=(ct&&ct.value.trim())||(currentScript&&currentScript.title)||'未命名任务';
       const snapshot={
-        comicTitle:(ct?ct.value:''),
+        comicTitle:title,
         currentScript:currentScript,
         generatedCharacters:generatedCharacters,
         generatedBackgrounds:generatedBackgrounds,
@@ -6358,7 +6426,7 @@
       // 从而避免侧栏出现重复任务。
       let res;
       if(currentTaskId){
-        res=await TaskAPI.update(currentTaskId,{data:snapshot});
+        res=await TaskAPI.update(currentTaskId,{title:title,data:snapshot});
       } else {
         res=await TaskAPI.create(title,snapshot);
         if(res.success&&res.task){ currentTaskId=res.task.id; }
@@ -6375,7 +6443,7 @@
       const ct=document.getElementById('comicTitle');
       const title=(ct&&ct.value.trim())||(currentScript&&currentScript.title)||'未命名任务';
       const snapshot={
-        comicTitle:(ct?ct.value:''),
+        comicTitle:title,
         currentScript:currentScript,
         generatedCharacters:generatedCharacters,
         generatedBackgrounds:generatedBackgrounds,
@@ -6389,7 +6457,7 @@
       };
       let res;
       if(currentTaskId){
-        res=await TaskAPI.update(currentTaskId,{data:snapshot});
+        res=await TaskAPI.update(currentTaskId,{title:title,data:snapshot});
       } else {
         res=await TaskAPI.create(title,snapshot);
         if(res.success&&res.task){ currentTaskId=res.task.id; }
