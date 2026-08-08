@@ -4285,19 +4285,34 @@ def get_font_path(font_family):
     font_info = FONT_FAMILIES.get(font_family)
     if font_info and os.path.exists(font_info['path']):
         return font_info['path']
-    
-    fallback_paths = [
+
+    # Railway 使用 Linux 容器，不能使用 Windows 随系统授权的微软雅黑文件。
+    # Docker 已安装 fonts-noto-cjk：对于“微软雅黑加粗”必须优先取 Noto 的
+    # Bold 字重，避免原先回退到 Regular 后公网成品看起来没有加粗。
+    bold_noto_paths = [
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc',
+        '/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc',
+        '/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc',
+    ]
+    regular_noto_paths = [
+        '/usr/share/fonts/truetype/noto/NotoSansCJK-SC.ttc',
+        '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+        '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc',
+    ]
+    fallback_paths = (
+        bold_noto_paths + regular_noto_paths
+        if font_family == 'msyhbd'
+        else [
         'C:/Windows/Fonts/msyh.ttc',
         'C:/Windows/Fonts/msyhbd.ttc',
         '/System/Library/Fonts/STHeiti Light.ttc',
         '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
         '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
-        '/usr/share/fonts/truetype/noto/NotoSansCJK-SC.ttc',
-        '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
-        '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
-        '/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc',
-        '/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc'
+        *regular_noto_paths,
+        *bold_noto_paths,
     ]
+    )
     
     for path in fallback_paths:
         if os.path.exists(path):
