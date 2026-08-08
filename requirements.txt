@@ -18,6 +18,9 @@ python-pptx==1.0.2
 PyMuPDF==1.24.3
 pytesseract==0.3.10
 pdf_oxide>=0.3.0
+# MP4 导出与视频直链：提供跨平台 ffmpeg 可执行文件。
+# 本地环境通常已间接安装，Railway 镜像必须显式声明。
+imageio-ffmpeg==0.6.0
 
 # ===== 可选重依赖（抠图/OCR 增强，按需安装；不装自动降级）=====
 # 不装时：
