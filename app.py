@@ -32,7 +32,7 @@ from datetime import datetime
 import time
 import concurrent.futures
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, redirect, url_for, session
+from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, redirect, url_for, session, abort
 from flask_cors import CORS
 
 import sys
@@ -10399,15 +10399,22 @@ def api_export():
 
 
 # ---------------------------------------------------------------------------
-# 视频直链导出（CloudStudio 静态托管）
+# 视频直链导出（Railway 永久链接 + 本地临时链接兼容）
 # ---------------------------------------------------------------------------
 # 背景：本地 Flask 进程会被系统回收，导致 /api/export 生成的分享链接失效。
 # 方案：把 MP4 + 自包含播放页写入一个独立部署目录，由主理人上传到 CloudStudio，
 #       得到不依赖本地服务的公网直链。本模块只负责"准备部署目录"，不做部署。
 
 VIDEO_SHARE_DEPLOY_ROOT = os.path.normpath(
-    r'C:/Users/matiancheng/WorkBuddy/2026-07-19-21-49-54/cloudstudio_deploy'
+    os.environ.get(
+        'VIDEO_SHARE_STORAGE_ROOT',
+        '/data/video_shares' if os.environ.get('RAILWAY_ENVIRONMENT')
+        else r'C:/Users/matiancheng/WorkBuddy/2026-07-19-21-49-54/cloudstudio_deploy'
+    )
 )
+
+BUNDLED_VIDEO_SHARE_ROOT = os.path.join(app.root_path, 'seed_video_shares')
+VIDEO_SHARE_MANIFEST_PATH = os.path.join(BUNDLED_VIDEO_SHARE_ROOT, 'manifest.json')
 
 VIDEO_SHARE_PAGE_TITLE = '漫画视频'
 
@@ -10415,6 +10422,73 @@ VIDEO_SHARE_PAGE_TITLE = '漫画视频'
 # 再由 cloudflared Quick Tunnel 暴露该服务器；不会把 Flask 主站暴露到公网。
 CLOUDFLARED_PATH = os.path.join(app.root_path, 'tools', 'cloudflared.exe')
 VIDEO_SHARE_TUNNELS = {}
+
+
+def _load_bundled_video_manifest():
+    """读取随部署发布的历史视频清单。"""
+    try:
+        with open(VIDEO_SHARE_MANIFEST_PATH, 'r', encoding='utf-8') as fh:
+            value = json.load(fh)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError) as exc:
+        logger.warning(f'[video-share] 历史视频清单读取失败: {exc}')
+        return {}
+
+
+BUNDLED_VIDEO_SHARE_MANIFEST = _load_bundled_video_manifest()
+
+
+def _safe_video_share_id(share_id):
+    """只允许短横线、下划线与 ASCII 字母数字，避免目录穿越。"""
+    value = str(share_id or '').strip().lower()
+    if not re.fullmatch(r'[a-z0-9_-]{3,64}', value):
+        abort(404)
+    return value
+
+
+def _resolve_video_share(share_id):
+    """先找 Volume 中的新视频，再找随程序发布的 40 份历史视频。"""
+    share_id = _safe_video_share_id(share_id)
+    storage_dir = os.path.join(VIDEO_SHARE_DEPLOY_ROOT, f'video_share_{share_id}')
+    storage_video = os.path.join(storage_dir, 'video.mp4')
+    storage_meta = os.path.join(storage_dir, 'metadata.json')
+    if os.path.isfile(storage_video):
+        title = VIDEO_SHARE_PAGE_TITLE
+        try:
+            with open(storage_meta, 'r', encoding='utf-8') as fh:
+                title = str((json.load(fh) or {}).get('title') or title)
+        except (OSError, ValueError, TypeError):
+            pass
+        return storage_video, title
+
+    bundled_meta = BUNDLED_VIDEO_SHARE_MANIFEST.get(share_id)
+    bundled_video = os.path.join(BUNDLED_VIDEO_SHARE_ROOT, f'{share_id}.mp4')
+    if bundled_meta and os.path.isfile(bundled_video):
+        title = bundled_meta.get('title') if isinstance(bundled_meta, dict) else bundled_meta
+        return bundled_video, str(title or VIDEO_SHARE_PAGE_TITLE)
+    abort(404)
+
+
+@app.route('/videos/<share_id>/')
+def permanent_video_share_page(share_id):
+    """Railway 上稳定不变的视频播放页。"""
+    _video_path, title = _resolve_video_share(share_id)
+    return build_video_share_page(
+        video_filename=url_for('permanent_video_share_media', share_id=share_id),
+        page_title=title
+    )
+
+
+@app.route('/videos/<share_id>/media')
+def permanent_video_share_media(share_id):
+    """支持浏览器 Range 请求的 MP4 文件响应。"""
+    video_path, title = _resolve_video_share(share_id)
+    return send_file(
+        video_path,
+        mimetype='video/mp4',
+        conditional=True,
+        download_name=f'{sanitize_export_filename(title)}.mp4'
+    )
 
 
 def _reserve_local_port():
@@ -10713,7 +10787,7 @@ def api_export_video_share():
         )
         os.makedirs(deploy_dir, exist_ok=True)
 
-        # 3) 写入 MP4（文件名 = 漫画名，便于分享后一眼认出内容）
+        # 3) 写入 MP4。固定文件名让永久路由不受中文标题和改名影响。
         share_script = data.get('script') or {}
         if isinstance(share_script, str):
             try:
@@ -10725,11 +10799,15 @@ def api_export_video_share():
         share_title = str(
             data.get('title') or share_script.get('title') or PPT_DEFAULT_TITLE
         ).strip() or PPT_DEFAULT_TITLE
-        mp4_filename = f'{sanitize_export_filename(share_title)}.mp4'
+        mp4_filename = 'video.mp4'
         mp4_path = os.path.normpath(os.path.join(deploy_dir, mp4_filename))
         with open(mp4_path, 'wb') as fh:
             fh.write(mp4_bytes)
         mp4_size = os.path.getsize(mp4_path)
+
+        with open(os.path.join(deploy_dir, 'metadata.json'), 'w', encoding='utf-8') as fh:
+            json.dump({'title': share_title, 'created_at': datetime.now().isoformat()}, fh,
+                      ensure_ascii=False, indent=2)
 
         # 4) 写入自包含响应式播放页（中文文件名需 URL 编码后再写进 <source src>）
         from urllib.parse import quote as _url_quote
@@ -10741,10 +10819,19 @@ def api_export_video_share():
                 page_title=share_title
             ))
 
-        # 5) 启动仅服务本次视频目录的临时公网链接（不暴露 Flask 主站）。
-        public_base = start_temporary_video_share(deploy_dir, share_id)
-        public_url = public_base + '/'
-        video_url = public_base + '/' + _url_quote(mp4_filename)
+        # 5) Railway 直接通过固定路由提供服务；本地仍保留 Quick Tunnel 兼容。
+        is_railway = bool(os.environ.get('RAILWAY_ENVIRONMENT'))
+        if is_railway:
+            public_url = url_for('permanent_video_share_page', share_id=share_id, _external=True)
+            video_url = url_for('permanent_video_share_media', share_id=share_id, _external=True)
+            share_mode = 'railway_persistent'
+            share_notice = '永久链接已保存到 Railway 持久化存储。'
+        else:
+            public_base = start_temporary_video_share(deploy_dir, share_id)
+            public_url = public_base + '/'
+            video_url = public_base + '/' + _url_quote(mp4_filename)
+            share_mode = 'temporary_tunnel'
+            share_notice = '本地临时链接：本机和本程序保持运行期间可访问。'
 
         deploy_dir_out = deploy_dir.replace('\\', '/').rstrip('/') + '/'
         app.logger.info(
@@ -10754,14 +10841,14 @@ def api_export_video_share():
 
         return jsonify({
             'success': True,
-            'message': '视频直链包已生成，等待 CloudStudio 部署',
+            'message': '视频直链已生成',
             'deploy_dir': deploy_dir_out,
             'mp4_size': mp4_size,
             'mp4_filename': mp4_filename,
             'public_url': public_url,
             'video_url': video_url,
-            'share_mode': 'temporary_tunnel',
-            'share_notice': '临时链接已启动：本机和本程序保持运行期间，其他用户可直接在手机打开。'
+            'share_mode': share_mode,
+            'share_notice': share_notice
         })
 
     except Exception as e:

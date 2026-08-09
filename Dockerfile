@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV PORT=5000
+ENV VIDEO_SHARE_STORAGE_ROOT=/data/video_shares
 EXPOSE 5000
 
 # 单 worker：app 持有内存态 + sqlite，多进程会串号
