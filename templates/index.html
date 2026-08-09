@@ -683,6 +683,22 @@
                 .login-workid{font-size:0.78rem;color:#aaa;}
                 .sidebar-msg{font-size:0.74rem;color:#FF9B9B;margin-top:6px;min-height:14px;}
                 .main-content{flex:1;min-width:0;}
+                .ark-guide-overlay{position:fixed;inset:0;background:rgba(13,16,28,.76);z-index:100000;display:flex;align-items:flex-start;justify-content:center;padding:28px 14px;overflow:auto;}
+                .ark-guide-modal{width:min(980px,96vw);background:#fff;color:#263044;border-radius:18px;box-shadow:0 22px 70px rgba(0,0,0,.35);overflow:hidden;}
+                .ark-guide-head{position:sticky;top:0;z-index:2;background:linear-gradient(135deg,#fff3f7,#eef4ff);padding:20px 24px;border-bottom:1px solid #e6e9f2;display:flex;align-items:center;gap:14px;}
+                .ark-guide-head h2{margin:0;flex:1;font-size:1.35rem;color:#27314b;}
+                .ark-guide-close{border:0;background:#e8ebf3;color:#4b5368;border-radius:50%;width:34px;height:34px;cursor:pointer;font-size:20px;}
+                .ark-guide-body{padding:22px 24px 28px;}
+                .ark-guide-callout{background:#fff8df;border:1px solid #f2d77d;border-radius:12px;padding:12px 15px;margin-bottom:18px;line-height:1.7;}
+                .ark-guide-step{border:1px solid #e2e6f0;border-radius:14px;padding:17px;margin:15px 0;background:#fbfcff;}
+                .ark-guide-step h3{margin:0 0 9px;color:#344165;font-size:1.08rem;}
+                .ark-guide-step p,.ark-guide-step li{line-height:1.75;margin:4px 0;}
+                .ark-guide-step img{display:block;width:100%;height:auto;margin-top:12px;border:1px solid #dfe3ec;border-radius:10px;background:#f5f6fa;}
+                .ark-model-name{display:inline-block;background:#e9efff;color:#3157a6;border-radius:6px;padding:2px 7px;font-weight:700;}
+                .ark-guide-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px;}
+                .ark-guide-actions a,.ark-guide-actions button{border:0;border-radius:9px;padding:10px 15px;cursor:pointer;text-decoration:none;font-size:.92rem;}
+                .ark-guide-primary{background:#5b67e8;color:#fff;}
+                .ark-guide-secondary{background:#edf0f7;color:#36405a;}
 
                 /* ===== 任务「节」管理（把左侧栏的若干「任务」整合成一个节） =====
                    注意：这里的「节」是任务级分组，不是漫画内部格子的分组。 */
@@ -6441,8 +6457,15 @@
           + '<div style="display:flex;gap:6px;margin-bottom:7px">'
           + '<button class="sidebar-btn" onclick="bindArkApiKey()">'+(user.ark_key_configured?'更新密钥':'绑定密钥')+'</button>'
           + (user.ark_key_configured?'<button class="sidebar-btn sidebar-btn-ghost" onclick="removeArkApiKey()">解除</button>':'')+'</div>'
-          + '<a href="https://console.volcengine.com/ark" target="_blank" rel="noopener" style="font-size:.76rem;color:#79b8ff">注册/开通豆包 API 指引 ↗</a>'
+          + '<button class="sidebar-btn sidebar-btn-ghost" style="width:100%;margin-bottom:7px" onclick="openArkGuide()">📘 小白图文开通教程</button>'
           + '<button class="sidebar-btn" style="width:100%" onclick="doLogout()">退出登录</button>';
+        if(!user.ark_key_configured){
+          const guideKey='arkGuideSeen:'+user.id;
+          if(!localStorage.getItem(guideKey)){
+            localStorage.setItem(guideKey,'1');
+            setTimeout(openArkGuide,350);
+          }
+        }
       } else {
         el.innerHTML = '<div class="sidebar-section-title">👤 个人登录</div>'
           + '<input id="loginWorkId" class="sidebar-input" placeholder="工号">'
@@ -6496,6 +6519,47 @@
       const res=await TaskAPI.removeArkKey();
       if(res.success){ showSuccess('已解除绑定'); await initSidebar(); }
       else showError(res.error||'解除失败');
+    }
+    function closeArkGuide(){
+      const overlay=document.getElementById('arkGuideOverlay');
+      if(overlay) overlay.remove();
+    }
+    function openArkGuide(){
+      closeArkGuide();
+      const overlay=document.createElement('div');
+      overlay.id='arkGuideOverlay';
+      overlay.className='ark-guide-overlay';
+      overlay.innerHTML=`<div class="ark-guide-modal" role="dialog" aria-modal="true" aria-label="豆包 API 开通图文教程">
+        <div class="ark-guide-head"><div style="font-size:28px">🧭</div><h2>豆包 API 小白开通教程（只需开通 2 个模型）</h2><button class="ark-guide-close" onclick="closeArkGuide()" aria-label="关闭">×</button></div>
+        <div class="ark-guide-body">
+          <div class="ark-guide-callout"><b>先看结论：</b>漫画系统只需要开通
+            <span class="ark-model-name">Doubao-Seed-Evolving</span>（写脚本、识别文字）和
+            <span class="ark-model-name">Doubao-Seedream-5.0-lite</span>（生成漫画背景/角色）。
+            <b>Seedance 视频、3D、语音、向量模型都不需要开通。</b>模型通常按实际调用量计费，请在火山引擎查看当前价格和免费额度。
+          </div>
+          <div class="ark-guide-step"><h3>第 1 步：进入「开通管理」→ 开通文字模型</h3>
+            <ol><li>登录火山方舟后，点击左下角<b>开通管理</b>。</li><li>选择<b>语言模型</b>。</li><li>找到 <span class="ark-model-name">Doubao-Seed-Evolving</span>，点击右侧<b>开通服务</b>并按页面确认。</li></ol>
+            <img src="/static/guide/ark_text_model.png" alt="语言模型页面中 Doubao-Seed-Evolving 的位置">
+          </div>
+          <div class="ark-guide-step"><h3>第 2 步：切换「视觉模型」→ 开通图片模型</h3>
+            <ol><li>仍在开通管理页面，点击<b>视觉模型</b>。</li><li>找到 <span class="ark-model-name">Doubao-Seedream-5.0-lite</span>。</li><li>右侧显示<b>已开通</b>即可；未开通就点击<b>开通服务</b>。</li></ol>
+            <img src="/static/guide/ark_models.png" alt="视觉模型页面中 Doubao-Seedream-5.0-lite 的位置">
+          </div>
+          <div class="ark-guide-step"><h3>第 3 步：进入「API Key 管理」→ 创建并复制密钥</h3>
+            <ol><li>点击左下角<b>API Key 管理</b>，不要在模型列表里找密钥。</li><li>点击紫色的<b>创建 API Key</b>；名称保持默认、权限选“全部”，然后确认创建。</li><li>点击密钥旁边的查看/复制图标，复制完整 API Key。密钥只粘贴到漫画系统，不要发到群聊或截图中。</li></ol>
+            <img src="/static/guide/ark_api_key.png" alt="火山方舟 API Key 管理和创建按钮位置">
+          </div>
+          <div class="ark-guide-step"><h3>第 4 步：回到漫画系统绑定</h3>
+            <p>关闭教程，点击左侧账号区的<b>绑定密钥</b>，粘贴刚复制的完整 API Key。绑定后页面只显示最后四位，完整密钥会在服务器加密保存。</p>
+          </div>
+          <div class="ark-guide-actions">
+            <a class="ark-guide-primary" href="https://console.volcengine.com/ark/region:cn-beijing/openManagement" target="_blank" rel="noopener">打开模型开通页 ↗</a>
+            <a class="ark-guide-secondary" href="https://console.volcengine.com/ark/region:cn-beijing/apiKey" target="_blank" rel="noopener">打开 API Key 管理 ↗</a>
+            <button class="ark-guide-primary" onclick="closeArkGuide();bindArkApiKey();">我已复制，立即绑定</button>
+          </div>
+        </div></div>`;
+      overlay.addEventListener('click',event=>{if(event.target===overlay) closeArkGuide();});
+      document.body.appendChild(overlay);
     }
     async function initSidebar(){
       const me=await TaskAPI.me();
