@@ -312,6 +312,26 @@ def get_random_ip_image():
         return None
 
 
+def get_selected_guide_image(characters, selected_sprite=None):
+    """返回用户为知识小精灵明确选择的本地图片；仅在没有选择时才随机回退。"""
+    candidates = []
+    if isinstance(characters, dict):
+        for name in ('知识小精灵', '小精灵', '精灵'):
+            if characters.get(name):
+                candidates.append(characters[name])
+    if selected_sprite:
+        candidates.append(selected_sprite)
+
+    root = os.path.abspath(app.root_path)
+    for url in candidates:
+        if not isinstance(url, str) or not url.startswith('/static/'):
+            continue
+        path = os.path.abspath(os.path.join(app.root_path, url.lstrip('/')))
+        if path.startswith(root + os.sep) and os.path.isfile(path):
+            return path
+    return get_random_ip_image()
+
+
 SCENARIO_STYLES = {
     'humorous': '幽默搞笑风格，夸张的表情和动作，让小朋友开怀大笑',
     'adventure': '冒险探索风格，神秘的场景，充满好奇心和探索精神',
@@ -4320,7 +4340,8 @@ def get_font_path(font_family):
     return None
 
 
-def calculate_character_positions(ip_images, bg_width, bg_height, speaker_index=-1, is_guide=False):
+def calculate_character_positions(ip_images, bg_width, bg_height, speaker_index=-1, is_guide=False,
+                                  character_names=None):
     if not ip_images:
         return [], [], []
     
@@ -4356,6 +4377,13 @@ def calculate_character_positions(ip_images, bg_width, bg_height, speaker_index=
 
         height_size = int(bg_height * height_cap)
         ip_size = min(width_size, height_size)
+        # 老师是成年人，不能和小学生/小精灵使用同一个视觉身高。
+        # 名称来自本格真正参与合成的角色，避免仅依赖图片文件名而误判。
+        character_name = ''
+        if isinstance(character_names, (list, tuple)) and idx < len(character_names):
+            character_name = str(character_names[idx] or '')
+        if character_name.endswith('老师'):
+            ip_size = int(ip_size * 1.24)
 
         ip_width, ip_height = ip_img.size
         ratio = min(ip_size / ip_width, ip_size / ip_height)
@@ -4387,7 +4415,8 @@ def calculate_character_positions(ip_images, bg_width, bg_height, speaker_index=
 
         for params in ip_transform_params:
             ip_w, ip_h = params['size']
-            ip_x = current_x
+            # 成人老师放大后，仍要完整落在画面内，不能因为两人居中计算而被裁切。
+            ip_x = max(10, min(current_x, bg_width - ip_w - 10))
             ip_y = bg_height - ip_h - 15
             ip_positions.append((ip_x, ip_y))
             current_x += ip_w + 25
@@ -4611,6 +4640,20 @@ def bubble_native_tail_kind(bubble_image_path):
     if '_07_diamond' in name:
         return 'bottom_left'
     return None
+
+
+def bubble_content_scale(bubble_image_path):
+    """返回素材气泡为容纳同量文字所需的额外外框缩放比例。
+
+    07 思考气泡的圆点尾巴占据整张 PNG 下方较大区域，真正可写字的主体
+    明显小于普通圆角气泡。若仍按 PNG 外接矩形计算，文字会贴边或被迫缩小。
+    """
+    if not bubble_image_path:
+        return 1.0, 1.0
+    name = os.path.basename(str(bubble_image_path)).lower()
+    if '_07_diamond' in name:
+        return 1.24, 1.28
+    return 1.0, 1.0
 
 
 def render_bubble(draw, bubble_x, bubble_y, bubble_width, bubble_height, style='rounded', 
@@ -4837,13 +4880,15 @@ def bubble_text_colors(bubble_image_path=None, fill_color=None):
 
 def render_text(draw, text, bubble_x, bubble_y, bubble_width, bubble_height, font,
                 line_height, padding=12, align='center', text_color=(50, 50, 50), font_path=None,
-                stroke_fill=None):
+                stroke_fill=None, content_bottom_inset=0):
     text = text.replace('\r', '').strip()
     if not text:
         return None
 
     max_width = bubble_width - padding * 2
-    max_height = bubble_height - padding * 2
+    # 原生尾巴气泡的尾巴不属于正文区域。为它预留空间，避免文字被下方尾巴挤出主体。
+    content_bottom_inset = max(0, int(content_bottom_inset or 0))
+    max_height = bubble_height - padding * 2 - content_bottom_inset
 
     def try_layout(current_font, current_size):
         """尝试用指定字号排版，返回 (是否放得下, lines, actual_line_height)"""
@@ -4905,6 +4950,9 @@ def render_text(draw, text, bubble_x, bubble_y, bubble_width, bubble_height, fon
         'font_size': current_size,
         'line_height': line_height,
         'stroke_width': stroke_width if stroke_fill is not None else 0,
+        # 把 Pillow 已验证的最终断行一并保存。编辑器直接复用它，就不会把中文
+        # 标点、书名号和粗体字重新按另一套浏览器规则拆开。
+        'rendered_text': '\n'.join(lines),
     }
 
 
@@ -5250,54 +5298,75 @@ def _wrap_dialogue_lines(draw, text, font, max_width, max_chars_per_line=11):
     """
     if not text:
         return []
-    text = text.replace('\r', '').replace('\n', '')
-    punctuation = '，。！？、；：,.!?;:\n'
-    segments = []
-    start = 0
-    for i, ch in enumerate(text):
-        if ch in punctuation:
-            if i + 1 > start:
-                segments.append(text[start:i + 1])
-            start = i + 1
-    if start < len(text):
-        segments.append(text[start:])
-    if not segments:
-        segments = [text]
+    text = text.replace('\r', '')
+    # 11 个字只是舒适阅读的软上限；标点、闭合书名号必须能跟随前字越过这一格。
+    forbidden_head = set('，。！？、；：”’）】〉》〕｝》…—,.!?;:)')
+    forbidden_tail = set('（【〈《〔｛“‘(')
 
-    lines = []
-    current_line = ""
-    for seg in segments:
-        for char in seg:
-            if len(current_line) >= max_chars_per_line:
-                lines.append(current_line)
-                current_line = ""
-            candidate = current_line + char
-            if draw.textlength(candidate, font=font) <= max_width:
-                current_line = candidate
-            else:
-                if current_line:
-                    lines.append(current_line)
+    # 短书名、引号、括号内容作为一个排版单元，优先整块留在同一行。
+    pairs = {'《': '》', '“': '”', '‘': '’', '（': '）', '【': '】', '(': ')'}
+    tokens, i = [], 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '\n':
+            tokens.append('\n'); i += 1; continue
+        close = pairs.get(ch)
+        if close:
+            end = text.find(close, i + 1)
+            if end != -1:
+                tokens.append(text[i:end + 1]); i = end + 1; continue
+        tokens.append(ch); i += 1
+
+    def fits(line, token, allow_soft_overflow=False):
+        candidate = line + token
+        if draw.textlength(candidate, font=font) > max_width:
+            return False
+        return allow_soft_overflow or len(candidate) <= max_chars_per_line
+
+    lines, current_line = [], ''
+    for token in tokens:
+        if token == '\n':
+            if current_line: lines.append(current_line); current_line = ''
+            continue
+        # 整块（例如《猜猜他是谁》）放不下时，先换行；空行仍放不下再安全地拆字。
+        if len(token) > 1 and not fits(current_line, token):
+            if current_line:
+                lines.append(current_line); current_line = ''
+            if fits('', token, allow_soft_overflow=True):
+                current_line = token
+                continue
+            token_parts = list(token)
+        else:
+            token_parts = [token]
+        for char in token_parts:
+            # 标点不得成为新行首；可在不超出像素宽度时突破 11 字软上限。
+            is_closing = char in forbidden_head
+            if current_line and fits(current_line, char, allow_soft_overflow=is_closing):
+                current_line += char
+                continue
+            if not current_line:
                 current_line = char
-                if draw.textlength(current_line, font=font) > max_width:
+                continue
+            # 若闭合标点因像素宽度放不下，把上一行最后一个字连同标点一起
+            # 挪到下一行。必须保持原文字符顺序；例如“看。”只能变成下一行
+            # 的“看。”，绝不能被重排成上一行末尾“。”、下一行“看”。
+            if is_closing and len(current_line) > 1:
+                moved = current_line[-1]
+                lines.append(current_line[:-1])
+                current_line = moved + char
+            else:
+                # 开书名号/开括号不应孤立在行尾，尽量连同下一个字留给下一行。
+                if current_line and current_line[-1] in forbidden_tail and len(current_line) > 1:
+                    moved = current_line[-1]
+                    current_line = current_line[:-1]
                     lines.append(current_line)
-                    current_line = ""
+                    current_line = moved + char
+                else:
+                    lines.append(current_line)
+                    current_line = char
     if current_line:
         lines.append(current_line)
-
-    # 避头标点：换行后一行不应以"句末标点 / 后括号 / 后引号"开头。
-    # 这类标点应回贴到上一行末尾；若上一行已满（再加会溢出）则保留在行首，
-    # 以保证可读性优先于绝对避头。
-    # 用 while 而非 if：连续多个标点（如 "！"）需逐个回贴，不能只移一个。
-    forbidden_head = set('，。！？、；：”’）】〉》·…—,.!?;:)')
-    fixed = []
-    for idx, line in enumerate(lines):
-        while (idx > 0 and line and len(fixed) > 0 and line[0] in forbidden_head
-                and len(fixed[-1]) < max_chars_per_line):
-            fixed[-1] = fixed[-1] + line[0]
-            line = line[1:]
-        if line:
-            fixed.append(line)
-    return fixed
+    return lines
 
 
 def map_action_to_pose(action):
@@ -5579,7 +5648,18 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
         speakers: 说话者列表，与dialogues对应
         skip_ip_overlay: 是否跳过IP贴图（背景已是完整场景时启用）
     """
-    is_guide = speaker == '知识小精灵'
+    # 旧脚本同时保留 `speaker`（单值）和 `speakers`（逐句列表）。
+    # 多人物格里只要主说话者碰巧是知识小精灵，不能把整格误判成
+    # “单独精灵格”，否则普通人物会被丢掉，精灵还会走两次绘制分支。
+    panel_speaker_names = []
+    if isinstance(speakers, (list, tuple)):
+        panel_speaker_names = [str(name).strip() for name in speakers if str(name).strip()]
+    elif speakers:
+        panel_speaker_names = [str(speakers).strip()]
+    if not panel_speaker_names and speaker:
+        panel_speaker_names = [str(speaker).strip()]
+    unique_panel_speakers = list(dict.fromkeys(panel_speaker_names))
+    is_guide = unique_panel_speakers == ['知识小精灵']
     # 收集合成元数据，用于前端编辑面板重建布局
     meta = {
         'success': True,
@@ -5633,11 +5713,17 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
 
         # ---- 决定用于绘制的角色图：有对话时按每句(动作)选姿势图，否则用标准图 ----
         if valid_pairs:
-            speaker_names = [s for (_, s) in valid_pairs]
+            # 人物图层按“角色”而不是按“台词”创建。同一人物连续说两句时，
+            # 仍只出现一次；气泡继续使用 valid_pairs，数量不受影响。
+            speaker_names = []
             _char_source_paths = []
             _char_source_urls = []
-            _pose_keys = []  # 记录每个有效对话对应的姿势键，供后续按朝向选侧身图
+            _pose_keys = []  # 与去重后的 speaker_names 一一对应
             for i, (ct, s) in enumerate(valid_pairs):
+                s = str(s or '').strip()
+                if s in speaker_names:
+                    continue
+                speaker_names.append(s)
                 action = valid_actions[i]
                 # 获取该角色的可用姿势
                 avail = {}
@@ -5708,40 +5794,11 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
         display_pose_keys = [_pose_keys[i] for i in display_indices]
         speaker_idx_in_display = display_indices.index(speaker_index) if speaker_index >= 0 else -1
         
+        display_character_names = [speaker_names[i] for i in display_indices]
         scaled_ips, ip_positions, ip_transform_params = calculate_character_positions(
-            display_images, bg_width, bg_height, speaker_idx_in_display, is_guide
+            display_images, bg_width, bg_height, speaker_idx_in_display, is_guide,
+            character_names=display_character_names,
         )
-        
-        if is_guide and len(ip_images) > 1:
-            guide_img = ip_images[0]
-            guide_size = int(bg_width * 0.18)
-            gw, gh = guide_img.size
-            guide_ratio = min(guide_size / gw, guide_size / gh)
-            guide_new_size = (int(gw * guide_ratio), int(gh * guide_ratio))
-            guide_img = guide_img.resize(guide_new_size, Image.BICUBIC)
-            
-            corner_x = bg_width - guide_new_size[0] - 20
-            corner_y = bg_height - guide_new_size[1] - 20
-            
-            guide_transformed = guide_img.copy()
-            # guide_transformed = guide_transformed.rotate(-10, expand=True, resample=Image.BICUBIC)  # 人物不再旋转
-            
-            bg_w, bg_h = guide_transformed.size
-            bg_ratio = min(guide_new_size[0] / bg_w, guide_new_size[1] / bg_h)
-            final_guide_size = (int(bg_w * bg_ratio), int(bg_h * bg_ratio))
-            guide_transformed = guide_transformed.resize(final_guide_size, Image.BICUBIC)
-            
-            background.paste(guide_transformed, (corner_x, corner_y), guide_transformed)
-            
-            glow_layer = Image.new('RGBA', background.size, (0, 0, 0, 0))
-            glow_draw = ImageDraw.Draw(glow_layer)
-            glow_radius = max(final_guide_size) // 2 + 15
-            cx = corner_x + final_guide_size[0] // 2
-            cy = corner_y + final_guide_size[1] // 2
-            for r in range(glow_radius, 0, -2):
-                alpha_val = max(0, int(30 * (r / glow_radius)))
-                glow_draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(255, 223, 255, alpha_val))
-            background = Image.alpha_composite(background, glow_layer)
         
         for i, (ip_img, (ip_x, ip_y), params) in enumerate(zip(scaled_ips, ip_positions, ip_transform_params)):
             # 完整场景模式下背景已含人物，跳过额外IP贴图（保留知识小精灵的单独处理）
@@ -5870,7 +5927,8 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
         if not font_path:
             logger.warning("未找到可用的字体文件，使用默认字体")
         
-        padding = 10  # 减小气泡内边距，让气泡更紧凑
+        # 正文与边缘必须有明显呼吸感；不再使用旧版“紧凑”10px 留白。
+        padding = 18
         # 多对白时收窄单个气泡，为横向并排预留空间。
         dialogue_count = max(1, len(valid_pairs))
         width_ratio = 0.60 if dialogue_count == 1 else (0.40 if dialogue_count == 2 else 0.22)
@@ -6144,8 +6202,13 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
             font = ImageFont.truetype(font_path, current_font_size) if font_path else ImageFont.load_default()
             line_height = current_font_size + 4
 
-            # 动态 padding：确保文字与气泡边缘有充足留白，避免文字溢出
-            padding = max(10, int(current_font_size * (0.55 if dialogue_count > 1 else 0.8)))
+            # 内容驱动的安全留白：图片气泡和异形气泡实际可用区域小于外接矩形，
+            # 所以使用比文字描边更大的内边距，不能让字贴着弧边/锯齿边。
+            # 气泡不仅要“刚好装下”文字，还应当留出可读的呼吸空间。单人气泡
+            # 尤其常用异形/椭圆素材，安全边距再大一些，避免文字贴到弧边。
+            # 预留的是文字到“可见气泡边缘”的安全区，而不只是外接矩形的空白。
+            # 方形、圆角方形等素材的描边/尾巴会侵占可用空间，因此再扩大一档。
+            padding = max(24, int(current_font_size * (1.30 if dialogue_count > 1 else 1.50)))
 
             # 与 render_text 共用断行逻辑，保证气泡尺寸和实际文字行数完全一致
             lines = _wrap_dialogue_lines(draw, dialogue_text, font, max_width, 11)
@@ -6160,7 +6223,7 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
                 current_font_size -= 2
                 font = ImageFont.truetype(font_path, current_font_size) if font_path else ImageFont.load_default()
                 line_height = current_font_size + 4
-                padding = max(10, int(current_font_size * (0.55 if dialogue_count > 1 else 0.8)))
+                padding = max(24, int(current_font_size * (1.30 if dialogue_count > 1 else 1.50)))
                 lines = _wrap_dialogue_lines(draw, dialogue_text, font, max_width, 11)
 
                 text_width = max(draw.textlength(line, font=font) for line in lines) if lines else 0
@@ -6317,6 +6380,46 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
                 emotion_bubble_path = get_random_bubble_image(emotion)
 
             native_tail_kind = bubble_native_tail_kind(emotion_bubble_path)
+            content_scale_x, content_scale_y = bubble_content_scale(emotion_bubble_path)
+            # 自带尾巴的 PNG 以“整张图”缩放，尾巴会占据下方一部分像素。
+            # 因此扩展图片总高度，并把新增部分留给尾巴；文字仍只在上方主体区域排版。
+            # 所有图片气泡都留一点下方安全区；带尾巴的素材再扩大到足够避开尾巴。
+            # 这会让气泡整体随内容变大，而不是牺牲字号或把文字压在尾巴上。
+            tail_content_inset = int(current_font_size * 0.35) if emotion_bubble_path else 0
+            if native_tail_kind:
+                tail_content_inset = max(tail_content_inset, max(18, int(current_font_size * 0.9)))
+
+            # 思考气泡的正文主体只占 PNG 上半部。以原中心为锚放大外框，
+            # 并在放大后重新执行位置避让，保证增加容量不会换来遮脸或压住其他气泡。
+            if content_scale_x != 1.0 or content_scale_y != 1.0:
+                old_center_x = bubble_x + bubble_width / 2
+                old_center_y = bubble_y + bubble_height / 2
+                max_bubble_width = bg_width - safe_margin_x * 2
+                max_bubble_height = bg_height - safe_margin_top - safe_margin_bottom
+                bubble_width = min(max_bubble_width, bubble_width * content_scale_x)
+                bubble_height = min(max_bubble_height, bubble_height * content_scale_y)
+                bubble_x = old_center_x - bubble_width / 2
+                bubble_y = old_center_y - bubble_height / 2
+
+            if tail_content_inset:
+                bubble_height += tail_content_inset
+            bubble_width = min(bubble_width, bg_width - safe_margin_x * 2)
+            bubble_height = min(
+                bubble_height, bg_height - safe_margin_top - safe_margin_bottom
+            )
+
+            if speaker_target and (content_scale_x != 1.0 or content_scale_y != 1.0):
+                sx, sy, sw, sh = speaker_target
+                bubble_x, bubble_y, tail_pos = _place_speaker_bubble(
+                    sx, sy, sw, sh, bubble_width, bubble_height, sx + sw / 2
+                )
+            else:
+                bubble_x = max(safe_margin_x, min(
+                    bubble_x, bg_width - bubble_width - safe_margin_x
+                ))
+                bubble_y = max(safe_margin_top, min(
+                    bubble_y, bg_height - bubble_height - safe_margin_bottom
+                ))
             if native_tail_kind and speaker_target:
                 sx, sy, sw, sh = speaker_target
                 target_x = sx + sw / 2
@@ -6376,7 +6479,8 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
             text_render_info = render_text(
                 bubble_draw, dialogue_text, bubble_x, bubble_y, bubble_width, bubble_height,
                 font, line_height, padding=padding, align=text_align, font_path=font_path,
-                text_color=text_color, stroke_fill=stroke_fill
+                text_color=text_color, stroke_fill=stroke_fill,
+                content_bottom_inset=tail_content_inset
             ) or {}
 
             background = Image.alpha_composite(background, bubble_layer)
@@ -6410,10 +6514,12 @@ def composite_image(background_data, ip_paths, dialogue, output_path, speaker=''
                 'font_weight': 'bold' if font_family == 'msyhbd' else 'normal',
                 'line_height': text_render_info.get('line_height', line_height),
                 'padding': padding,
+                'content_bottom_inset': tail_content_inset,
                 'text_align': text_align,
                 'text_color': list(text_color[:3]),
                 'stroke_fill': list(stroke_fill[:3]) if stroke_fill else None,
                 'stroke_width': text_render_info.get('stroke_width', 0),
+                'rendered_text': text_render_info.get('rendered_text', dialogue_text),
                 'rendered_layer_url': bubble_layer_url,
                 'rendered_layer_x': bubble_layer_box[0] if bubble_layer_box else bubble_x,
                 'rendered_layer_y': bubble_layer_box[1] if bubble_layer_box else bubble_y,
@@ -9323,6 +9429,14 @@ def api_export():
             export_format = _get_field('format', 'images')
             comic_images = raw_images or []
             script = _get_field('script', {})
+            if isinstance(script, str):
+                try:
+                    script = json.loads(script)
+                except Exception:
+                    script = {}
+            if not isinstance(script, dict):
+                script = {}
+            export_title = str(_get_field('title', '') or '').strip()
             animation = _get_field('animation', 'fade')
             layout_config = raw_layout
             share_mode = _get_field('share_mode', 'server')
@@ -9338,7 +9452,11 @@ def api_export():
             task = tasks[task_id]
             comic_images = task.comics
             script = task.script
+            export_title = str(getattr(task, 'title', '') or '').strip()
             layout_config = None  # GET 路径无布局配置，汇总图按默认 four-grid（与原行为一致）
+
+        if not isinstance(script, dict):
+            script = {}
         
         # 部署时设置 PUBLIC_BASE_URL（例如 https://comic.example.com）。本机开发仍可
         # 正常使用 localhost；分享页中的所有图片也使用同一公开域名，避免外部访问者加载不到图。
@@ -9398,6 +9516,8 @@ def api_export():
                     logger.warning(f"汇总图生成失败（不影响单格导出）: {agg_e}")
 
                 zip_buffer = BytesIO()
+                zip_title = export_title or str(script.get('title') or '').strip()
+                zip_basename = sanitize_export_filename(zip_title or PPT_DEFAULT_TITLE)
 
                 with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
                     for i, comic_url in enumerate(comic_images):
@@ -9406,25 +9526,17 @@ def api_export():
                             # 不再无脑优先旧残留 panel_i_edited.png
                             img_path = os.path.join(app.root_path, comic_url.split('?')[0].lstrip('/'))
                             if os.path.exists(img_path):
-                                zipf.write(img_path, f'comic_{i+1}.png')
+                                zipf.write(img_path, f'{zip_basename}_第{i+1}格.png')
                             else:
                                 edited_path = os.path.join(app.root_path, 'static', 'output', f'panel_{i}_edited.png')
                                 if os.path.exists(edited_path):
-                                    zipf.write(edited_path, f'comic_{i+1}.png')
+                                    zipf.write(edited_path, f'{zip_basename}_第{i+1}格.png')
                     if aggregate_bytes:
-                        zipf.writestr('comic_aggregate.png', aggregate_bytes)
+                        zipf.writestr(f'{zip_basename}_合并图.png', aggregate_bytes)
 
                 zip_buffer.seek(0)
 
                 # 压缩包文件名 = 漫画名，与 PPT / MP4 导出保持一致的命名规则
-                zip_title = ''
-                if isinstance(script, dict):
-                    zip_title = str(script.get('title') or '').strip()
-                if not zip_title and request.method == 'POST':
-                    zip_title = str(
-                        (request.get_json(silent=True) or {}).get('title') or ''
-                    ).strip()
-                zip_basename = sanitize_export_filename(zip_title or PPT_DEFAULT_TITLE)
                 return send_file(
                     zip_buffer,
                     mimetype='application/zip',
@@ -9438,7 +9550,6 @@ def api_export():
         
         elif export_format == 'mp4':
             try:
-                import imageio_ffmpeg
                 import subprocess
                 import tempfile
                 import shutil
@@ -9447,7 +9558,17 @@ def api_export():
                 # Image/ImageDraw 已在模块顶部导入，此处不再重复导入
                 # （重复导入会让 Image 成为函数局部变量，导致 PPT 分支 UnboundLocalError）
 
-                FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+                # 优先使用项目依赖自带的 ffmpeg；若环境尚未安装该 Python 包，
+                # 仍可使用系统 PATH 中的 ffmpeg，避免因单个可选模块直接中断导出。
+                try:
+                    import imageio_ffmpeg
+                    FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+                except ImportError:
+                    FFMPEG = shutil.which('ffmpeg')
+                    if not FFMPEG:
+                        raise RuntimeError(
+                            '视频组件未安装，请在项目虚拟环境中安装 imageio-ffmpeg'
+                        )
 
                 # 读取 MP4 专用参数（兼容 JSON 体与 multipart 表单）
                 def _mp4_field(name, default=None):
@@ -9829,9 +9950,10 @@ def api_export():
                     # 4) 读取到内存后再清理临时目录，确保安全返回
                     with open(best_path, 'rb') as _fh:
                         _buf = BytesIO(_fh.read())
-                    task_id = str(uuid.uuid4())[:8]
+                    mp4_title = export_title or str(script.get('title') or '').strip()
+                    mp4_basename = sanitize_export_filename(mp4_title or PPT_DEFAULT_TITLE)
                     return send_file(_buf, mimetype='video/mp4', as_attachment=True,
-                                     download_name=f'comic_{task_id}.mp4')
+                                     download_name=f'{mp4_basename}.mp4')
                 finally:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
             except Exception as e:
@@ -10321,29 +10443,57 @@ def start_temporary_video_share(deploy_dir, share_id):
         creationflags=creation_flags
     )
 
-    log_path = os.path.join(deploy_dir, 'cloudflared.log')
-    log_handle = open(log_path, 'w+', encoding='utf-8')
-    tunnel_process = subprocess.Popen(
-        [CLOUDFLARED_PATH, 'tunnel', '--no-autoupdate', '--url', f'http://127.0.0.1:{port}'],
-        stdin=null_output, stdout=log_handle, stderr=subprocess.STDOUT,
-        creationflags=creation_flags
-    )
-
+    # Quick Tunnel 偶尔会受网络抖动或 Cloudflare 首次分配延迟影响。此前只
+    # 尝试一次、等待 25 秒，因此看起来像“偶发点击报错”。静态服务只启动一次，
+    # 隧道则最多重试一次，每次等待 40 秒。
+    log_handle = None
+    tunnel_process = None
     public_base = None
+    last_error = ''
     try:
-        # cloudflared 会把随机 trycloudflare 地址写进启动日志；最多等待 25 秒。
-        for _ in range(50):
-            if tunnel_process.poll() is not None:
+        time.sleep(0.4)
+        if http_process.poll() is not None:
+            raise RuntimeError('本机视频临时服务启动失败。')
+
+        for attempt in range(2):
+            log_path = os.path.join(deploy_dir, f'cloudflared_{attempt + 1}.log')
+            log_handle = open(log_path, 'w+', encoding='utf-8')
+            tunnel_process = subprocess.Popen(
+                [CLOUDFLARED_PATH, 'tunnel', '--no-autoupdate', '--url', f'http://127.0.0.1:{port}'],
+                stdin=null_output, stdout=log_handle, stderr=subprocess.STDOUT,
+                creationflags=creation_flags
+            )
+            # cloudflared 会把随机 trycloudflare 地址写进启动日志；每次最多等待 40 秒。
+            for _ in range(80):
+                if tunnel_process.poll() is not None:
+                    break
+                log_handle.flush()
+                log_handle.seek(0)
+                match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', log_handle.read())
+                if match:
+                    public_base = match.group(0).rstrip('/')
+                    break
+                time.sleep(0.5)
+            if public_base:
                 break
+
             log_handle.flush()
             log_handle.seek(0)
-            match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', log_handle.read())
-            if match:
-                public_base = match.group(0).rstrip('/')
-                break
-            time.sleep(0.5)
+            last_error = log_handle.read()[-500:].strip()
+            if tunnel_process.poll() is None:
+                tunnel_process.terminate()
+                try:
+                    tunnel_process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    tunnel_process.kill()
+            log_handle.close()
+            log_handle = None
+            tunnel_process = None
+            if attempt == 0:
+                time.sleep(1)
         if not public_base:
-            raise RuntimeError('Cloudflare 临时隧道未能启动，请检查网络后重试。')
+            detail = f'（{last_error[-160:]}）' if last_error else ''
+            raise RuntimeError(f'Cloudflare 临时隧道未能启动，请检查网络后重试。{detail}')
 
         VIDEO_SHARE_TUNNELS[share_id] = {
             'http_process': http_process,
@@ -10355,9 +10505,10 @@ def start_temporary_video_share(deploy_dir, share_id):
         return public_base
     except Exception:
         for process in (tunnel_process, http_process):
-            if process.poll() is None:
+            if process is not None and process.poll() is None:
                 process.terminate()
-        log_handle.close()
+        if log_handle is not None:
+            log_handle.close()
         raise
 
 
@@ -11121,6 +11272,24 @@ def _ppt_rgb(value, default=PPT_DEFAULT_TEXT_RGB):
     return tuple(default)
 
 
+def _ppt_is_transparent_color(value):
+    """判断网页颜色是否明确表示透明，供 PPT 气泡底色使用。"""
+    text = str(value or '').strip().lower().replace(' ', '')
+    if text in ('', 'transparent', 'none'):
+        return True
+    match = re.fullmatch(r'rgba\(([^)]*)\)', text)
+    if match:
+        parts = [part.strip() for part in match.group(1).split(',')]
+        if len(parts) >= 4:
+            try:
+                return float(parts[3]) <= 0.001
+            except (TypeError, ValueError):
+                return False
+    if re.fullmatch(r'#?[0-9a-f]{8}', text):
+        return int(text.lstrip('#')[-2:], 16) == 0
+    return False
+
+
 def _ppt_align(value):
     """把 textAlign / text_align 映射成 ``PP_ALIGN`` 枚举。
 
@@ -11304,17 +11473,28 @@ def normalize_ppt_bubble(raw, canvas_size):
         return None
 
     canvas_w, canvas_h = canvas_size
-    text = _ppt_pick(raw, ('text', 'content', 'dialogue', 'caption'), '')
+    # 合成预览时 Pillow 已经按中文标点、气泡可用宽度计算出最终换行。
+    # PPT 必须优先复用它，不能把原始台词交给 PowerPoint 再断一次行。
+    rendered_text = _ppt_pick(raw, ('rendered_text', 'renderedText'), '')
+    text = rendered_text or _ppt_pick(raw, ('text', 'content', 'dialogue', 'caption'), '')
     text = str(text or '').strip()
 
-    box_x = _ppt_num(_ppt_pick(raw, ('x', 'left')), 0)
-    box_y = _ppt_num(_ppt_pick(raw, ('y', 'top')), 0)
-    box_w = _ppt_num(_ppt_pick(raw, ('width', 'w')), 0)
-    box_h = _ppt_num(_ppt_pick(raw, ('height', 'h')), 0)
+    # 编辑器中气泡外形（红框）与文字（蓝框）可以分别移动；导出时必须
+    # 优先读各自的坐标，不能再把文字硬塞回气泡位置。
+    box_x = _ppt_num(_ppt_pick(raw, ('bubble_x', 'bubbleX', 'x', 'left')), 0)
+    box_y = _ppt_num(_ppt_pick(raw, ('bubble_y', 'bubbleY', 'y', 'top')), 0)
+    box_w = _ppt_num(_ppt_pick(raw, ('bubble_width', 'bubbleWidth', 'width', 'w')), 0)
+    box_h = _ppt_num(_ppt_pick(raw, ('bubble_height', 'bubbleHeight', 'height', 'h')), 0)
     if box_w <= 0:
         box_w = canvas_w * 0.35
     if box_h <= 0:
         box_h = canvas_h * 0.14
+
+    text_x = _ppt_num(_ppt_pick(raw, ('text_x', 'textX')), box_x)
+    text_y = _ppt_num(_ppt_pick(raw, ('text_y', 'textY')), box_y)
+    text_w = _ppt_num(_ppt_pick(raw, ('text_width', 'textWidth')), box_w)
+    if text_w <= 0:
+        text_w = box_w
 
     plain_path = resolve_local_asset_path(
         _ppt_pick(raw, ('bubbleImage', 'bubble_image', 'bubble_url', 'bubbleUrl'))
@@ -11353,23 +11533,30 @@ def normalize_ppt_bubble(raw, canvas_size):
 
     return {
         'text': text,
+        'has_exact_line_breaks': bool(rendered_text),
         'image_path': image_path,
         'baked': baked,
         'image_x': img_x,
         'image_y': img_y,
         'image_width': img_w,
         'image_height': img_h,
-        'x': box_x,
-        'y': box_y,
-        'width': box_w,
+        'x': text_x,
+        'y': text_y,
+        'width': text_w,
         'height': box_h,
         'padding': max(_ppt_num(_ppt_pick(raw, ('padding', 'logicalPadding')), 8.0), 0.0),
         'font_size': font_size,
+        'line_height': max(_ppt_num(_ppt_pick(raw, ('line_height', 'lineHeight', 'lineHeightPx')), font_size * 1.16), 1.0),
         'font_family': _ppt_font_name(_ppt_pick(raw, ('fontFamily', 'font_family'))),
         'rgb': _ppt_rgb(color_value),
         'bold': font_weight in ('bold', 'bolder', '600', '700', '800', '900') or font_weight == 'true',
         'italic': font_style in ('italic', 'oblique'),
         'align': _ppt_pick(raw, ('textAlign', 'text_align', 'align'), 'center'),
+        'background_rgb': _ppt_rgb(_ppt_pick(raw, ('backgroundColor', 'background_color')), (255, 255, 255)),
+        'background_transparent': _ppt_is_transparent_color(_ppt_pick(raw, ('backgroundColor', 'background_color'))),
+        'border_rgb': _ppt_rgb(_ppt_pick(raw, ('borderColor', 'border_color')), (34, 34, 34)),
+        'border_transparent': _ppt_is_transparent_color(_ppt_pick(raw, ('borderColor', 'border_color'))),
+        'border_width': max(_ppt_num(_ppt_pick(raw, ('borderWidth', 'border_width')), 2.0), 0.0),
     }
 
 
@@ -11427,7 +11614,9 @@ def add_ppt_text_shape(slide, left, top, width, height, bubble, scale, shape_nam
         pass
 
     text_frame = textbox.text_frame
-    text_frame.word_wrap = True
+    # 已保存了预览最终换行时，关闭 PowerPoint 二次换行，避免中文粗体和
+    # 书名号/标点被 PPT 拆成与漫画预览不同的行；旧数据仍保留自动换行兼容。
+    text_frame.word_wrap = not bubble.get('has_exact_line_breaks', False)
 
     # 内边距按网页 padding 等比换算，并留出安全上限，避免小气泡把文字挤没
     inset = int(max(min(bubble['padding'] * scale, width * 0.25, height * 0.25), 0))
@@ -11442,6 +11631,15 @@ def add_ppt_text_shape(slide, left, top, width, height, bubble, scale, shape_nam
 
     paragraph = text_frame.paragraphs[0]
     paragraph.alignment = _ppt_align(bubble['align'])
+    # Pillow 预览是固定像素行高；PPT 默认行距会随字体替换变化，导致文字块
+    # 在同一气泡内变高或变矮，因此同样换算为固定 pt 行距。
+    try:
+        line_pt = bubble['line_height'] * scale / float(PPT_EMU_PER_PT)
+        paragraph.line_spacing = Pt(max(0.5, round(line_pt, 2)))
+        paragraph.space_before = Pt(0)
+        paragraph.space_after = Pt(0)
+    except Exception:
+        pass
 
     run = paragraph.add_run()
     run.text = bubble['text']
@@ -11485,6 +11683,7 @@ def add_layered_panel_to_slide(slide, panel, panel_index, cell_left, cell_top,
     from pptx.util import Pt
     from pptx.dml.color import RGBColor
     from pptx.enum.text import PP_ALIGN
+    from pptx.enum.shapes import MSO_SHAPE
 
     stats = {
         'layered': False, 'background': 0, 'characters': 0,
@@ -11568,23 +11767,48 @@ def add_layered_panel_to_slide(slide, panel, panel_index, cell_left, cell_top,
 
     # 先铺所有气泡底图，再铺所有文字框：保证文字层始终压在气泡层之上
     for bubble_i, bubble in enumerate(bubbles):
-        if not bubble['image_path']:
-            continue
         left, top, width, height = _to_slide_rect(
             bubble['image_x'], bubble['image_y'],
             bubble['image_width'], bubble['image_height']
         )
+        if bubble['image_path']:
+            try:
+                picture = slide.shapes.add_picture(
+                    bubble['image_path'], left, top, width=width, height=height
+                )
+                picture.name = (
+                    f'BubbleRendered_{tag}_{bubble_i + 1}' if bubble['baked']
+                    else f'BubbleImg_{tag}_{bubble_i + 1}'
+                )
+                stats['bubble_images'] += 1
+            except Exception as bubble_err:
+                logger.warning(f"[export-ppt] 气泡图插入失败({bubble['image_path']}): {bubble_err}")
+                stats['missing'] += 1
+            continue
+
+        # 普通气泡在网页中本来就是 Fabric 的矩形而非图片文件。旧代码
+        # 因为找不到 bubbleImage 而直接跳过，造成下载 PPT 只有文字没有
+        # 气泡。这里改为原生可编辑圆角矩形，位置、颜色、边框均取保存数据。
         try:
-            picture = slide.shapes.add_picture(
-                bubble['image_path'], left, top, width=width, height=height
-            )
-            picture.name = (
-                f'BubbleRendered_{tag}_{bubble_i + 1}' if bubble['baked']
-                else f'BubbleImg_{tag}_{bubble_i + 1}'
-            )
+            shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, left, top, width, height)
+            shape.name = f'BubbleShape_{tag}_{bubble_i + 1}'
+            fill_r, fill_g, fill_b = bubble['background_rgb']
+            line_r, line_g, line_b = bubble['border_rgb']
+            if bubble['background_transparent']:
+                # rgba(..., 0) 在网页是透明；若解析成 RGB(0,0,0) 后再 solid，
+                # PowerPoint 就会显示成黑色气泡。
+                shape.fill.background()
+            else:
+                shape.fill.solid()
+                shape.fill.fore_color.rgb = RGBColor(fill_r, fill_g, fill_b)
+            if bubble['border_transparent'] or bubble['border_width'] <= 0:
+                shape.line.fill.background()
+            else:
+                shape.line.color.rgb = RGBColor(line_r, line_g, line_b)
+                shape.line.width = max(int(bubble['border_width'] * scale), 1)
             stats['bubble_images'] += 1
-        except Exception as bubble_err:
-            logger.warning(f"[export-ppt] 气泡图插入失败({bubble['image_path']}): {bubble_err}")
+        except Exception as bubble_shape_err:
+            logger.warning(f'[export-ppt] 原生气泡形状插入失败: {bubble_shape_err}')
             stats['missing'] += 1
 
     for bubble_i, bubble in enumerate(bubbles):
@@ -11911,7 +12135,9 @@ def api_generate_character_image():
             return jsonify({'success': False, 'error': '角色名称不能为空', 'error_code': 'EMPTY_NAME'}), 400
 
         # === 预设 IP 角色（许多/莉莉/高远/哈哈/...）直接返回静态姿势库，不走 Pollinations 生图 ===
-        preset_poses = get_preset_poses(name) or get_preset_poses(data.get('preset'))
+        # 用户在页面手动指定的形象必须优先于脚本中的角色原名。
+        # 否则“许多/莉莉/知识小精灵”等已有名字会先命中默认库，覆盖用户刚选的其他小精灵。
+        preset_poses = get_preset_poses(data.get('preset')) or get_preset_poses(name)
         if preset_poses:
             logger.info(f"角色[{name}] 命中预设 IP 姿势库({len(preset_poses)}个)，直接返回静态姿势图")
             return jsonify({
@@ -12445,6 +12671,7 @@ def api_generate_comic_from_script():
         character_descriptions = data.get('characterDescriptions', script.get('characters', []))
         integrated_scene = data.get('integrated_scene', False)
         character_poses = data.get('characterPoses', {})  # 角色名 -> {poseKey: url}
+        selected_guide_sprite = data.get('selectedGuideSprite')
         # 按人物批量指定气泡：人物名 -> 气泡标识（emotion key 或气泡图片 url）
         character_bubble_map = data.get('characterBubbleMap', {})
         if not isinstance(character_bubble_map, dict):
@@ -12651,7 +12878,7 @@ def api_generate_comic_from_script():
                         ip_paths.append(os.path.join(app.root_path, characters[sp].lstrip('/')))
                         speaker_names.append(sp)
                     elif sp == '知识小精灵':
-                        default_ip = get_random_ip_image()
+                        default_ip = get_selected_guide_image(characters, selected_guide_sprite)
                         if default_ip:
                             ip_paths.append(default_ip)
                             speaker_names.append(sp)
@@ -12659,14 +12886,14 @@ def api_generate_comic_from_script():
                 ip_paths = [os.path.join(app.root_path, characters[speaker].lstrip('/'))]
                 speaker_names = [speaker]
             elif speaker == '知识小精灵':
-                default_ip = get_random_ip_image()
+                default_ip = get_selected_guide_image(characters, selected_guide_sprite)
                 if default_ip:
                     ip_paths = [default_ip]
                     speaker_names = [speaker]
             
             # 如果panel_spec指定了guide_sprite，但当前没有知识小精灵，自动加上
             if panel_spec and panel_spec.get('guide_sprite') and '知识小精灵' not in speaker_names:
-                default_ip = get_random_ip_image()
+                default_ip = get_selected_guide_image(characters, selected_guide_sprite)
                 if default_ip:
                     ip_paths.append(default_ip)
                     speaker_names.append('知识小精灵')
@@ -12896,9 +13123,12 @@ def api_export_comic():
     """导出漫画（批量打包为ZIP）"""
     try:
         import json
+        from urllib.parse import quote
         data = request.get_json()
         
         images = data.get('images', [])
+        export_title = str(data.get('title') or '').strip()
+        export_basename = sanitize_export_filename(export_title or PPT_DEFAULT_TITLE)
         
         if not images:
             return jsonify({'error': '没有可导出的图片'}), 400
@@ -12926,9 +13156,9 @@ def api_export_comic():
                     # strip ?t= 查询串，保证编辑过的格子也能正确写入 comic_N.png
                     img_path = os.path.join(app.root_path, img_url.split('?')[0].lstrip('/'))
                     if os.path.exists(img_path):
-                        zipf.write(img_path, f'comic_{i+1}.png')
+                        zipf.write(img_path, f'{export_basename}_第{i+1}格.png')
             if aggregate_bytes:
-                zipf.writestr('comic_aggregate.png', aggregate_bytes)
+                zipf.writestr(f'{export_basename}_合并图.png', aggregate_bytes)
         
         zip_buffer.seek(0)
         if data.get('prepare_download'):
@@ -12940,15 +13170,15 @@ def api_export_comic():
                 export_file.write(zip_buffer.getvalue())
             return jsonify({
                 'success': True,
-                'filename': export_name,
-                'download_url': f'/api/download_export/{export_name}'
+                'filename': f'{export_basename}_图片.zip',
+                'download_url': f'/api/download_export/{export_name}?download_name={quote(f"{export_basename}_图片.zip")}'
             })
         
         return send_file(
             zip_buffer,
             mimetype='application/zip',
             as_attachment=True,
-            download_name=f'comic_export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
+            download_name=f'{export_basename}_图片.zip'
         )
         
     except Exception as e:
@@ -12965,8 +13195,13 @@ def download_export_file(filename):
     export_path = os.path.join(OUTPUT_DIR, safe_name)
     if not os.path.isfile(export_path):
         return jsonify({'error': '下载文件不存在或已过期'}), 404
+    requested_name = str(request.args.get('download_name') or '').strip()
+    if requested_name.lower().endswith('.zip'):
+        requested_name = f'{sanitize_export_filename(requested_name[:-4])}.zip'
+    else:
+        requested_name = safe_name
     return send_file(export_path, mimetype='application/zip', as_attachment=True,
-                     download_name=safe_name, conditional=True)
+                     download_name=requested_name, conditional=True)
 
 
 @app.errorhandler(404)
@@ -13039,6 +13274,9 @@ def save_panel_edit():
     import traceback
     try:
         panel_index = request.form.get('panel_index', '0')
+        # 编辑后的成图不能再使用 panel_0_edited.png 这类全局固定名。
+        # 不同任务编辑同一格时会互相覆盖该文件，造成任务预览串图。
+        task_id = request.form.get('task_id', '').strip()
         image_data = request.form.get('image_data', '')
         bubbles_data = request.form.get('bubbles', '')
         
@@ -13047,7 +13285,7 @@ def save_panel_edit():
         else:
             panel_index = 0
         
-        logger.info(f"收到保存面板编辑请求: panel_index={panel_index}, image_data长度={len(image_data) if image_data else 0}, bubbles长度={len(bubbles_data) if bubbles_data else 0}")
+        logger.info(f"收到保存面板编辑请求: task_id={task_id or 'unsaved'}, panel_index={panel_index}, image_data长度={len(image_data) if image_data else 0}, bubbles长度={len(bubbles_data) if bubbles_data else 0}")
         
         if not image_data or len(image_data) < 100:
             logger.error(f"缺少图片数据或图片数据过短: {len(image_data) if image_data else 0}")
@@ -13085,7 +13323,10 @@ def save_panel_edit():
         logger.info(f"输出目录: {output_dir}")
         logger.info(f"目录是否可写: {os.access(output_dir, os.W_OK)}")
         
-        output_path = os.path.join(output_dir, f'panel_{panel_index}_edited.png')
+        # task_id 仅用于可读性；UUID 使同一任务反复保存同一格也不会覆盖旧任务。
+        safe_task_id = ''.join(ch for ch in task_id if ch.isalnum() or ch in ('-', '_'))[:48] or 'unsaved'
+        filename = f'panel_{safe_task_id}_{panel_index}_{uuid.uuid4().hex[:12]}_edited.png'
+        output_path = os.path.join(output_dir, filename)
         logger.info(f"输出路径: {output_path}")
 
         try:
@@ -13115,7 +13356,7 @@ def save_panel_edit():
             logger.error(f"图片处理失败: {str(img_err)}\n{traceback.format_exc()}")
             return jsonify({'error': f'图片处理失败: {str(img_err)}'}), 500
 
-        url = f'/static/output/panel_{panel_index}_edited.png?t={int(time.time())}'
+        url = f'/static/output/{filename}?t={int(time.time())}'
         return jsonify({'success': True, 'url': url})
     except Exception as e:
         logger.error(f"保存面板编辑失败: {str(e)}\n{traceback.format_exc()}")
@@ -13172,11 +13413,23 @@ def init_user_db():
             user_id INTEGER NOT NULL,
             title TEXT NOT NULL,
             pinned INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 0,
             data_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id)
         )''')
+        # 兼容已经存在的本地数据库：任务位置必须独立于 updated_at，保存编辑时不应跳到第一项。
+        columns = {row['name'] for row in conn.execute('PRAGMA table_info(tasks)').fetchall()}
+        if 'sort_order' not in columns:
+            conn.execute('ALTER TABLE tasks ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0')
+            for user_row in conn.execute('SELECT DISTINCT user_id FROM tasks').fetchall():
+                task_rows = conn.execute(
+                    'SELECT id FROM tasks WHERE user_id=? ORDER BY pinned DESC, updated_at DESC, id DESC',
+                    (user_row['user_id'],),
+                ).fetchall()
+                for order, task_row in enumerate(task_rows, start=1):
+                    conn.execute('UPDATE tasks SET sort_order=? WHERE id=?', (order, task_row['id']))
         # 「节」是任务级分组，必须随账号持久化，不能只依赖浏览器 localStorage。
         conn.execute('''CREATE TABLE IF NOT EXISTS task_sections (
             user_id INTEGER PRIMARY KEY,
@@ -13273,7 +13526,7 @@ def api_list_tasks():
     conn = get_db_conn()
     try:
         rows = conn.execute(
-            'SELECT id, title, pinned, data_json, created_at, updated_at FROM tasks WHERE user_id=? ORDER BY pinned DESC, updated_at DESC',
+            'SELECT id, title, pinned, sort_order, data_json, created_at, updated_at FROM tasks WHERE user_id=? ORDER BY pinned DESC, sort_order ASC, id ASC',
             (user['id'],)).fetchall()
     finally:
         conn.close()
@@ -13284,7 +13537,7 @@ def api_list_tasks():
         except Exception:
             data = {}
         tasks.append({'id': r['id'], 'title': r['title'], 'pinned': bool(r['pinned']),
-                      'data': data, 'created_at': r['created_at'], 'updated_at': r['updated_at']})
+                      'sort_order': r['sort_order'], 'data': data, 'created_at': r['created_at'], 'updated_at': r['updated_at']})
     return jsonify({'success': True, 'tasks': tasks})
 
 
@@ -13374,14 +13627,50 @@ def api_create_comic_task():
     now = _now()
     conn = get_db_conn()
     try:
+        next_order = conn.execute(
+            'SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_order FROM tasks WHERE user_id=?',
+            (user['id'],),
+        ).fetchone()['next_order']
         cur = conn.execute(
-            'INSERT INTO tasks (user_id, title, pinned, data_json, created_at, updated_at) VALUES (?,?,0,?,?,?)',
-            (user['id'], title, json.dumps(task_data, ensure_ascii=False), now, now))
+            # 7 个字段：user_id、title、固定的 pinned=0，以及 4 个动态值。
+            # 原来这里多写了一个占位符，导致每次新建任务均触发 SQLite 500，
+            # 表现为“点击保存任务后侧边栏没有新增任务”。
+            'INSERT INTO tasks (user_id, title, pinned, sort_order, data_json, created_at, updated_at) VALUES (?,?,0,?,?,?,?)',
+            (user['id'], title, next_order, json.dumps(task_data, ensure_ascii=False), now, now))
         tid = cur.lastrowid
         conn.commit()
     finally:
         conn.close()
-    return jsonify({'success': True, 'task': {'id': tid, 'title': title, 'pinned': False, 'data': task_data}})
+    return jsonify({'success': True, 'task': {'id': tid, 'title': title, 'pinned': False, 'sort_order': next_order, 'data': task_data}})
+
+
+@app.route('/api/tasks/order', methods=['PUT'])
+def api_reorder_comic_tasks():
+    """Persist a user-chosen task sequence without touching updated_at."""
+    user = get_current_user()
+    if not user:
+        return jsonify({'success': False, 'error': '未登录'}), 401
+    payload = request.get_json(force=True, silent=True) or {}
+    task_ids = payload.get('task_ids')
+    if not isinstance(task_ids, list) or not task_ids:
+        return jsonify({'success': False, 'error': '任务排序数据无效'}), 400
+    try:
+        ordered_ids = [int(item) for item in task_ids]
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': '任务编号无效'}), 400
+    if len(set(ordered_ids)) != len(ordered_ids):
+        return jsonify({'success': False, 'error': '任务排序包含重复项'}), 400
+    conn = get_db_conn()
+    try:
+        owned = {row['id'] for row in conn.execute('SELECT id FROM tasks WHERE user_id=?', (user['id'],)).fetchall()}
+        if set(ordered_ids) != owned:
+            return jsonify({'success': False, 'error': '任务排序与当前账号不一致，请刷新后重试'}), 400
+        for order, task_id in enumerate(ordered_ids, start=1):
+            conn.execute('UPDATE tasks SET sort_order=? WHERE id=? AND user_id=?', (order, task_id, user['id']))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'success': True})
 
 @app.route('/api/tasks/<int:task_id>', methods=['PUT'])
 def api_update_task(task_id):
@@ -13430,5 +13719,12 @@ def api_delete_task(task_id):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"启动Flask应用，端口: {port}")
-    # debug=True 开启 Werkzeug reloader：修改 app.py 或模板后自动重启 Flask 让改动生效
-    app.run(host='0.0.0.0', port=port, debug=True, threaded=True)
+    # 开发时仍保留代码/模板热重载，但忽略运行时生成的图片、ZIP、PPT 和视频。
+    # 否则用户一导出文件，Werkzeug 会中断正在发送的自动保存请求，造成任务丢失。
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        debug=True,
+        threaded=True,
+        exclude_patterns=['static/output/*', 'static\\output\\*'],
+    )

@@ -660,12 +660,19 @@
                 .task-list{display:flex;flex-direction:column;gap:8px;}
                 .task-item{background:rgba(255,255,255,0.06);border-radius:8px;padding:8px 10px;cursor:pointer;}
                 .task-item:hover{background:rgba(255,255,255,0.12);}
+                /* 当前打开的任务：即使它位于置顶区或任意「节」中，也给出一致的视觉提示。 */
+                .task-item.task-item-active{background:rgba(255,107,157,0.26);box-shadow:inset 3px 0 0 #FF78A5,0 0 0 1px rgba(255,179,198,0.55);}
+                .task-item.task-item-active .task-item-title{color:#fff3f7;}
+                .task-item.task-item-active .task-item-meta{color:#ffd7e4;}
                 .task-item-title{font-size:0.9rem;font-weight:bold;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
                 .task-item-meta{font-size:0.72rem;color:#aaa;margin:2px 0 4px;}
                 .task-item-actions{display:flex;gap:10px;}
                 .task-action{font-size:0.72rem;color:#87CEEB;cursor:pointer;}
                 .task-action:hover{text-decoration:underline;}
                 .task-del{color:#FF9B9B;}
+                .task-order-tools{display:flex;gap:5px;margin:-2px 0 8px;}
+                .task-order-tools button{border:1px solid rgba(255,179,198,.55);border-radius:6px;background:#3a3a4d;color:#ffe2ec;padding:4px 6px;font-size:.72rem;cursor:pointer;}
+                .task-order-tools button:hover{background:#54465a;}
                 .sidebar-empty{font-size:0.78rem;color:#888;padding:6px 2px;}
                 .sidebar-login{margin-top:auto;}
                 .sidebar-input{width:100%;box-sizing:border-box;margin-bottom:6px;padding:7px 9px;border-radius:7px;border:1px solid #555;background:#1f1f2b;color:#eee;font-size:0.85rem;}
@@ -748,6 +755,10 @@
             </div>
             <div class="sidebar-section">
                 <div class="sidebar-section-title">📚 任务</div>
+                <div class="task-order-tools" title="保存或编辑任务不会改变这里的排序">
+                    <button type="button" onclick="sortTasksByTitle('asc')">🔢 升序</button>
+                    <button type="button" onclick="sortTasksByTitle('desc')">🔢 降序</button>
+                </div>
                 <div id="taskList" class="task-list"></div>
                 <div id="taskEmpty" class="sidebar-empty">生成后可保存</div>
             </div>
@@ -1272,7 +1283,7 @@
                         <span style="color: #FF6B9D; font-weight: bold;">背景音乐：</span>
                         <select id="bgmSelect" onchange="toggleBgmUpload()" style="padding: 6px 12px; border: 2px solid #FFB3C6; border-radius: 8px; background: white; color: #FF6B9D; font-size: 0.9rem; cursor: pointer; outline: none;">
                             <option value="none">无</option>
-                            <option value="calm">舒缓·宁静</option>
+                            <option value="calm" selected>舒缓·宁静</option>
                             <option value="peaceful">舒缓·平和</option>
                             <option value="piano">钢琴·轻快</option>
                             <option value="upload">上传音乐</option>
@@ -1359,6 +1370,9 @@
         var characterPoses = {};  // 角色名 -> {poseKey: url}，第二步生成的姿势库
         var currentComics = [];
         var currentTaskId = null;   // 当前漫画对应的自动保存任务 id（首次生成创建，之后更新）
+        // 每次打开保存任务都会递增。恢复过程中存在异步布局加载；旧任务完成得更晚时
+        // 必须丢弃其后续 UI 回写，不能把旧标题/提示词污染到新任务。
+        var taskRestoreVersion = 0;
         let layoutPrompts = [];
         let currentLayoutConfig = null;
         let loadingTimer = null;
@@ -1830,40 +1844,41 @@
         }
 
         function autoWrapDialogue(text, maxChars = 11) {
-            const parts = splitActionAndDialogue(text);
-            let result = '';
-            let lineLen = 0;
-            for (const part of parts) {
-                if (part.type === 'action') {
-                    result += part.text;
-                    continue;
+            // 与后端 _wrap_dialogue_lines 对齐：标点不出现在行首，书名号/引号
+            // 尽量作为整体保留，11 字是软上限而不是把句末标点硬拆出去。
+            const forbiddenHead = new Set('，。！？；：、】【》）〕〉」』”’,.!?;:)]}');
+            const forbiddenTail = new Set('【《（〔〈「『“‘([{');
+            const pairs = {'《':'》','【':'】','（':'）','〔':'〕','〈':'〉','「':'」','『':'』','“':'”','‘':'’','(':')'};
+            const source = String(text || '').replace(/\r/g, '');
+            const tokens = [];
+            for (let i = 0; i < source.length; i++) {
+                const ch = source[i];
+                if (ch === '\n') { tokens.push(ch); continue; }
+                const close = pairs[ch];
+                if (close) {
+                    const end = source.indexOf(close, i + 1);
+                    if (end !== -1) { tokens.push(source.slice(i, end + 1)); i = end; continue; }
                 }
-                const lines = part.text.split('\n');
-                lines.forEach((line, idx) => {
-                    if (idx > 0) {
-                        result += '\n';
-                        lineLen = 0;
-                    }
-                    let remaining = line;
-                    while (remaining.length > 0) {
-                        const space = maxChars - lineLen;
-                        if (space <= 0) {
-                            result += '\n';
-                            lineLen = 0;
-                            continue;
-                        }
-                        if (remaining.length <= space) {
-                            result += remaining;
-                            lineLen += remaining.length;
-                            break;
-                        }
-                        result += remaining.slice(0, space) + '\n';
-                        remaining = remaining.slice(space);
-                        lineLen = 0;
-                    }
-                });
+                tokens.push(ch);
             }
-            return result;
+            const output = []; let line = '';
+            const push = () => { if (line) output.push(line); line = ''; };
+            for (const token of tokens) {
+                if (token === '\n') { push(); continue; }
+                const parts = token.length > maxChars ? Array.from(token) : [token];
+                for (const part of parts) {
+                    const wouldOverflow = line.length + part.length > maxChars;
+                    if (!line || !wouldOverflow || (part.length === 1 && forbiddenHead.has(part))) {
+                        line += part;
+                        continue;
+                    }
+                    if (forbiddenTail.has(line[line.length - 1]) && line.length > 1) {
+                        const opener = line.slice(-1); line = line.slice(0, -1); push(); line = opener + part;
+                    } else { push(); line = part; }
+                }
+            }
+            push();
+            return output.join('\n');
         }
 
         function dialogueLineLengths(text) {
@@ -2254,8 +2269,15 @@
                     characters: characters,
                     panels: panels
                 };
-                // 新剧本：重置当前自动保存任务，避免与上一部漫画混在一起
+                // 新剧本必须彻底切断上一部漫画的所有分层缓存，避免相同格子下标
+                // 复用旧背景、角色或成品 URL。
                 currentTaskId = null;
+                generatedCharacters = {};
+                generatedBackgrounds = {};
+                characterPoses = {};
+                currentComics = [];
+                currentLayoutConfig = null;
+                currentSelectedTemplate = null;
                 btn.disabled = false;
                 return true;
             } else {
@@ -2280,7 +2302,7 @@
         }
 
         // 默认选择布布；不再在角色库中展示“知识小精灵”。
-        let selectedSprite = '/static/poses/bubu/stand.png';
+        let selectedSprite = localStorage.getItem('defaultGuideSprite') || '/static/poses/bubu/stand.png';
         let selectedPreset = 'bubu';
 
         // ===== 自动识别脚本中的预设角色（许多/莉莉/哈哈/张驰/大唐/徐剑） =====
@@ -2320,12 +2342,27 @@
             if (!currentScript || !currentScript.characters) return;
             const matched = [];
             currentScript.characters.forEach((char, index) => {
-                let preset = findPresetForCharacter(char.name);
+                // 顶部精灵库指定的自定义小精灵优先级最高，不能被默认布布覆盖。
+                if (char.customSpriteUrl) {
+                    const avatar = document.getElementById(`avatar${index}`);
+                    if (avatar) avatar.innerHTML = `<img src="${char.customSpriteUrl}" alt="${char.name}">`;
+                    generatedCharacters[char.name] = char.customSpriteUrl;
+                    characterPoses[char.name] = {
+                        stand: char.customSpriteUrl,
+                        static_float: char.customSpriteUrl,
+                        float_ask: char.customSpriteUrl,
+                        wave_interact: char.customSpriteUrl
+                    };
+                    return;
+                }
+                let preset = char.preset ? { key: char.preset, name: char.name, folder: char.preset } : findPresetForCharacter(char.name);
 
                 // 非预设角色统一回退到默认的布布形象
                 if (!preset) {
                     preset = { key: 'bubu', name: '布布', folder: 'bubu' };
                 }
+                // 首次自动分配也记录下来；之后点击“重新生成”不会意外回退到别的默认形象。
+                if (!char.preset) char.preset = preset.key;
 
                 // 标准图路径：精灵用 sprite_standard.png，其余用 stand.png
                 let standUrl;
@@ -2370,6 +2407,29 @@
             element.classList.add('selected');
             selectedSprite = element.dataset.sprite;
             selectedPreset = element.dataset.preset || null;
+            localStorage.setItem('defaultGuideSprite', selectedSprite);
+
+            // 顶部精灵卡片代表知识小精灵的默认形象：写入脚本与角色缓存，
+            // 不要求用户再到下方角色卡片额外点一次“使用漫画角色”。
+            if (currentScript) {
+                currentScript.defaultGuideSprite = selectedSprite;
+                (currentScript.characters || []).forEach((character, index) => {
+                    const name = String(character && character.name || '');
+                    if (!name.includes('精灵')) return;
+                    character.customSpriteUrl = selectedSprite;
+                    delete character.preset;
+                    generatedCharacters[name] = selectedSprite;
+                    characterPoses[name] = {
+                        stand: selectedSprite,
+                        static_float: selectedSprite,
+                        float_ask: selectedSprite,
+                        wave_interact: selectedSprite
+                    };
+                    const avatar = document.getElementById(`avatar${index}`);
+                    if (avatar) avatar.innerHTML = `<img src="${selectedSprite}" alt="${name}">`;
+                });
+                checkCharactersReady();
+            }
             showSuccess('已选择精灵角色：' + element.querySelector('div').textContent);
         }
         
@@ -2384,6 +2444,8 @@
 
             // 预设 IP 角色（许多/莉莉）：走生成接口拉取静态姿势库，而非单张精灵图
             if (selectedPreset) {
+                // 写入脚本快照，任务保存/再次打开/重新生成都沿用用户本次选择。
+                character.preset = selectedPreset;
                 avatar.innerHTML = `<img src="${selectedSprite}" alt="${character.name}">`;
                 showLoading(`正在载入 "${character.name}" 的预设姿势库（${selectedPreset}）...`);
                 generateCharacter(index, false, selectedPreset)
@@ -2590,7 +2652,8 @@
                         provider: (localStorage.getItem('genEngine') || 'pollinations'),
                         seed: Math.floor(Math.random() * 900000) + 100000,
                         dialogues: allDialogues,
-                        preset: presetOverride || null
+                        // 显式选择优先；没有显式参数时，也使用此前为该角色保存的选择。
+                        preset: presetOverride || character.preset || null
                     })
                 });
                 
@@ -4023,6 +4086,7 @@
                         integrated_scene: false,
                         characterPoses: characterPoses,
                         characterBubbleMap: characterBubbleMap,
+                        selectedGuideSprite: (currentScript && currentScript.defaultGuideSprite) || selectedSprite || null,
                         logoUrl: currentLogoUrl || null,
                         logoPosition: currentLogoPosition,
                         logoSize: currentLogoSize
@@ -4284,10 +4348,11 @@
             
             try {
                 const comicUrls = currentComics.map(c => c.url || c);
+                const comicTitle = getComicExportTitle();
                 const response = await fetch('/api/export_comic', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ images: comicUrls, layout_config: currentLayoutConfig, logoUrl: currentLogoUrl || null, logoPosition: currentLogoPosition, logoSize: currentLogoSize, prepare_download: true })
+                    body: JSON.stringify({ images: comicUrls, title: comicTitle, layout_config: currentLayoutConfig, logoUrl: currentLogoUrl || null, logoPosition: currentLogoPosition, logoSize: currentLogoSize, prepare_download: true })
                 });
                 
                 if (response.ok) {
@@ -4297,7 +4362,7 @@
                     if (!result.download_url) throw new Error('服务器没有返回下载地址');
                     const link = document.createElement('a');
                     link.href = result.download_url;
-                    link.download = result.filename || `comic_export_${Date.now()}.zip`;
+                    link.download = result.filename || `${comicTitle}_图片.zip`;
                     document.body.appendChild(link);
                     link.click();
                     link.remove();
@@ -4371,6 +4436,13 @@
             stopBgmPreview();
         }
 
+        // 所有导出共用同一份标题，避免 ZIP、MP4、视频直链各自使用内部时间戳名称。
+        function getComicExportTitle() {
+            const titleInput = document.getElementById('comicTitle');
+            return (titleInput && titleInput.value.trim()) ||
+                (currentScript && currentScript.title) || '大阅读精灵漫画';
+        }
+
         let _bgmPreviewUrl = null;
         function stopBgmPreview() {
             const audio = document.getElementById('bgmPreviewAudio');
@@ -4438,13 +4510,15 @@
 
                 // 背景音乐及音量/淡入淡出
                 const bgmSelect = document.getElementById('bgmSelect');
-                const bgm = bgmSelect ? bgmSelect.value : 'none';
+                const bgm = bgmSelect ? bgmSelect.value : 'calm';
                 const volume = (document.getElementById('bgmVolume') ? document.getElementById('bgmVolume').value : 70) / 100;
                 const fadeIn = parseFloat(document.getElementById('bgmFadeIn') ? document.getElementById('bgmFadeIn').value : '1') || 0;
                 const fadeOut = parseFloat(document.getElementById('bgmFadeOut') ? document.getElementById('bgmFadeOut').value : '1') || 0;
 
                 const baseFields = {
                     format: 'mp4',
+                    title: getComicExportTitle(),
+                    script: currentScript || {},
                     images: comicUrls,
                     panels: currentComics,        // 透传分层数据，支持真正动态效果
                     animation: animation,
@@ -4468,6 +4542,8 @@
                     fd.append('panels', JSON.stringify(baseFields.panels));
                     fd.append('layout_config', JSON.stringify(baseFields.layout_config));
                     fd.append('format', baseFields.format);
+                    fd.append('title', baseFields.title);
+                    fd.append('script', JSON.stringify(baseFields.script));
                     fd.append('animation', baseFields.animation);
                     fd.append('logoUrl', baseFields.logoUrl === null ? '' : baseFields.logoUrl);
                     fd.append('logoPosition', baseFields.logoPosition);
@@ -4494,7 +4570,7 @@
                     const url = window.URL.createObjectURL(blob);
                     const link = document.createElement('a');
                     link.href = url;
-                    link.download = `comic_${Date.now()}.mp4`;
+                    link.download = `${getComicExportTitle()}.mp4`;
                     link.click();
                     window.URL.revokeObjectURL(url);
                     showSuccess('MP4视频下载成功！');
@@ -4516,8 +4592,7 @@
         function collectVideoExportFields() {
             const comicUrls = (currentComics || []).map(c => c.url || c).filter(u => u);
             const titleInput = document.getElementById('comicTitle');
-            const comicTitle = (titleInput && titleInput.value.trim()) ||
-                (currentScript && currentScript.title) || '漫画视频';
+            const comicTitle = getComicExportTitle();
 
             const animSelect = document.getElementById('animationSelect');
             const animation = animSelect ? animSelect.value : 'fade';
@@ -4526,7 +4601,7 @@
             const resolution = resEl ? resEl.value : 'hd';
 
             const bgmSelect = document.getElementById('bgmSelect');
-            const bgm = bgmSelect ? bgmSelect.value : 'none';
+            const bgm = bgmSelect ? bgmSelect.value : 'calm';
             const volume = (document.getElementById('bgmVolume') ? document.getElementById('bgmVolume').value : 70) / 100;
             const fadeIn = parseFloat(document.getElementById('bgmFadeIn') ? document.getElementById('bgmFadeIn').value : '1') || 0;
             const fadeOut = parseFloat(document.getElementById('bgmFadeOut') ? document.getElementById('bgmFadeOut').value : '1') || 0;
@@ -4880,7 +4955,11 @@
                     preserveObjectStacking: true,
                     stopContextMenu: true,
                     selection: true,
-                    enableRetinaScaling: false
+                    enableRetinaScaling: false,
+                    // 气泡底层在缩放画布中很容易刚好点到边缘；关闭像素级命中
+                    // 并给命中范围留出余量，确保点击气泡空白处始终能选中红框。
+                    perPixelTargetFind: false,
+                    targetFindTolerance: 10
                 });
                 // 取证+修复：用 setDimensions 正式设定画布尺寸，保证 upper/lower 两层一致（解决点不到/导出错位）
                 window.editorCanvas.setDimensions({ width: cw, height: ch }, { cssOnly: false });
@@ -4924,7 +5003,9 @@
 
                 // 🔧 整图烘焙模式：background_url 为空 → 后端仅返回成品图（已含动作姿势人物）
                 // 此时预览与编辑都直接展示该图，禁止再叠加独立人物/气泡层，否则会与预览姿势不一致
-                const isBakedMode = !originalBgUrl;
+                // 已归档的旧任务用的是当时导出的完整成品图。旧版本没有把气泡皮肤图层
+                // 单独保存，若再按残缺元数据叠加会造成文字和气泡错位；此时优先忠实展示成品。
+                const isBakedMode = !originalBgUrl || !!(comicMeta && comicMeta.legacy_baked_preview);
 
                 // 是否有后端返回的合成元数据（人物/气泡精确位置）
                 const hasMeta = comicMeta && (
@@ -5017,24 +5098,36 @@
                                     padding: b.padding,
                                     lineHeightPx: b.line_height,
                                     textAlign: b.text_align || 'center',
+                                    renderedText: b.rendered_text || '',
                                     exactPreviewLayout: true,
                                     previewWidth: b.width * objectScaleX,
                                     previewHeight: b.height * objectScaleY,
+                                    bubbleX: (b.bubble_x !== undefined ? b.bubble_x : b.x) * objectScaleX,
+                                    bubbleY: (b.bubble_y !== undefined ? b.bubble_y : b.y) * objectScaleY,
+                                    bubbleWidth: (b.bubble_width || b.width) * objectScaleX,
+                                    bubbleHeight: (b.bubble_height || b.height) * objectScaleY,
+                                    textX: b.text_x !== undefined ? b.text_x * objectScaleX : undefined,
+                                    textY: b.text_y !== undefined ? b.text_y * objectScaleY : undefined,
+                                    textWidth: b.text_width ? b.text_width * objectScaleX : undefined,
+                                    // 保存完整来源，编辑后再次保存时不能只剩下“白色圆角框”。
+                                    // 其中包含原始气泡图片、尾巴、星形等样式字段。
+                                    sourceBubbleMeta: b,
                                     coordinateScaleX: objectScaleX,
                                     coordinateScaleY: objectScaleY
                                 };
-                                if (b.rendered_layer_url) {
-                                    addRenderedBubbleLayer(b, objectScaleX, objectScaleY, opts);
-                                } else {
-                                    addBubbleToEditor(
-                                        b.text,
-                                        b.x * objectScaleX,
-                                        b.y * objectScaleY,
-                                        b.width * objectScaleX,
-                                        b.height * objectScaleY,
-                                        opts
-                                    );
-                                }
+                                // 成品预览里的 rendered_layer_url 是「气泡 + 文字」烘焙图。
+                                // 若直接把它放进编辑器，浏览器只能选中整张图，无法分别
+                                // 操作气泡与文字；这正是“本地看不到红/蓝独立控制框”的原因。
+                                // 编辑器始终由原始 metadata 重建为两个 Fabric 对象：
+                                // 气泡底图（红框）与 Textbox（蓝框）。成品图仅用于预览。
+                                addBubbleToEditor(
+                                    b.text,
+                                    b.x * objectScaleX,
+                                    b.y * objectScaleY,
+                                    b.width * objectScaleX,
+                                    b.height * objectScaleY,
+                                    opts
+                                );
                             });
                             showSuccess(`已加载${savedBubbles.length}个对话气泡，双击即可编辑`);
                         } else {
@@ -5271,6 +5364,12 @@
             
             const radius = opts.radius ? parseInt(opts.radius) : 10;
             const bubbleImage = opts.bubbleImage || (window.currentEditorBubbleStyle && window.currentEditorBubbleStyle.imageUrl) || null;
+            // 保存后再次打开时，气泡框和文字框可以各自有位置。旧数据没有
+            // textX/textY 时仍按原规则放在气泡内，不破坏既有任务。
+            const boxLeft = opts.bubbleX !== undefined ? opts.bubbleX : (x || 0);
+            const boxTop = opts.bubbleY !== undefined ? opts.bubbleY : (y || 0);
+            const boxWidth = opts.bubbleWidth || w || 200;
+            const boxHeight = opts.bubbleHeight || h;
             const exactPreviewLayout = opts.exactPreviewLayout === true;
             const fontScale = exactPreviewLayout
                 ? Math.min(opts.coordinateScaleX || 1, opts.coordinateScaleY || 1)
@@ -5286,22 +5385,27 @@
             // 实际可用宽度计算本气泡一行真正能放下的字数，取两者较小值。
             // 这样旧任务双击转为 Fabric 文本后不会再越出气泡边缘。
             const textAreaWidth = exactPreviewLayout
-                ? Math.max(12, (w || 200) - editorPadding * 2)
-                : (w || 200);
+                ? Math.max(12, boxWidth - editorPadding * 2)
+                : boxWidth;
             const maxCharsByWidth = Math.max(1, Math.floor(
                 textAreaWidth / Math.max(1, editorFontSize * 1.04)
             ));
-            const bubbleText = autoWrapDialogue(text || '', Math.min(11, maxCharsByWidth));
+            // 新生成的气泡带有 Pillow 的最终断行记录；打开编辑器时必须原样使用，
+            // 这样首次进入的文字与漫画预览完全一致。用户改字后才使用同一套中文规则重排。
+            // 没有后端最终断行的旧气泡才按当前气泡宽度做一次兜底换行；编辑器内
+            // 不再把 11 字当作硬上限。新气泡仍直接使用预览已经验证的 renderedText。
+            const bubbleText = opts.renderedText || autoWrapDialogue(text || '', maxCharsByWidth);
             
             const bubble = new fabric.Textbox(bubbleText || '双击编辑文字', {
-                left: exactPreviewLayout ? ((x || 0) + editorPadding) : (x || 50),
-                top: exactPreviewLayout ? ((y || 0) + editorPadding) : (y || 50),
+                left: opts.textX !== undefined ? opts.textX : (exactPreviewLayout ? boxLeft + editorPadding : (x || 50)),
+                top: opts.textY !== undefined ? opts.textY : (exactPreviewLayout ? boxTop + editorPadding : (y || 50)),
                 // Fabric 的 width 不含 padding；此前传入整块气泡宽度后又加 padding，
                 // 文字实际可用区域比预览更宽并溢出到相邻气泡。
-                width: textAreaWidth,
-                // Fabric 默认仅在空格处断词；中文没有空格，11 个较宽的粗体字仍会
-                // 冲出气泡。逐字折行后同时满足“最多 11 字/行”和气泡实际宽度。
-                splitByGrapheme: true,
+                width: opts.textWidth || textAreaWidth,
+                // 新生成面板已经保存了 Pillow 最终断行（renderedText）。此时绝不能
+                // 再让 Fabric 根据浏览器字体二次折行，否则编辑器会和预览出现不同
+                // 的中文/标点布局；用户真正改字后，编辑事件会再调用中文断行规则。
+                splitByGrapheme: !(exactPreviewLayout && opts.renderedText),
                 fontSize: editorFontSize,
                 lineHeight: editorLineHeight,
                 textAlign: opts.textAlign || 'left',
@@ -5312,10 +5416,12 @@
                 // 画布上把 1px 白描边放大成比黑字更粗的白框。
                 strokeWidth: Math.min((opts.strokeWidth || 0) * fontScale, Math.max(0, editorFontSize * 0.06)),
                 strokeUniform: true,
-                backgroundColor: (bubbleImage || exactPreviewLayout) ? 'rgba(0,0,0,0)' : (opts.backgroundColor !== undefined ? opts.backgroundColor : '#ffffff'),
+                // 文字永远是独立层，不能再承担气泡底色；否则点击气泡空白处
+                // 也会选中文字，用户看不到独立的红色气泡控制框。
+                backgroundColor: 'rgba(0,0,0,0)',
                 padding: editorPadding,
-                borderColor: (bubbleImage || exactPreviewLayout) ? 'transparent' : (opts.borderColor || '#4A90D9'),
-                borderWidth: (bubbleImage || exactPreviewLayout) ? 0 : (opts.borderWidth || 2),
+                borderColor: '#2196F3',
+                borderWidth: 0,
                 cornerColor: '#4A90D9',
                 cornerSize: 8,
                 transparentCorners: false,
@@ -5339,18 +5445,21 @@
                 rx: radius,
                 ry: radius
             });
-            bubble.previewBoxWidth = exactPreviewLayout ? (opts.previewWidth || w) : null;
-            bubble.previewBoxHeight = exactPreviewLayout ? (opts.previewHeight || h) : null;
+            bubble.previewBoxWidth = exactPreviewLayout ? (opts.previewWidth || boxWidth) : null;
+            bubble.previewBoxHeight = exactPreviewLayout ? (opts.previewHeight || boxHeight) : null;
             bubble.previewTextOffsetY = exactPreviewLayout ? editorPadding : 0;
-            bubble.previewBoxLeft = exactPreviewLayout ? (x || 0) : null;
-            bubble.previewBoxTop = exactPreviewLayout ? (y || 0) : null;
+            bubble.previewBoxLeft = exactPreviewLayout ? boxLeft : null;
+            bubble.previewBoxTop = exactPreviewLayout ? boxTop : null;
             bubble.logicalFontSize = opts.fontSize || 18;
             bubble.logicalPadding = opts.padding !== undefined ? opts.padding : 10;
             bubble.sourceFontFamily = opts.fontFamily || bubble.fontFamily;
-            bubble.maxCharsPerLine = Math.min(11, maxCharsByWidth);
+            // 任务切换与再次编辑都依赖这份完整样式快照。仅保存 x/y/颜色会使
+            // 特殊气泡在下一次恢复时降级为普通圆角框。
+            bubble.sourceBubbleMeta = opts.sourceBubbleMeta ? JSON.parse(JSON.stringify(opts.sourceBubbleMeta)) : null;
+            bubble.maxCharsPerLine = maxCharsByWidth;
             if (exactPreviewLayout && bubble.previewBoxHeight) {
                 // Pillow 预览在气泡内垂直居中；Fabric Textbox 不会自动做该计算。
-                bubble.top = (y || 0) + Math.max(editorPadding,
+                bubble.top = boxTop + Math.max(editorPadding,
                     (bubble.previewBoxHeight - bubble.getScaledHeight()) / 2);
             }
 
@@ -5360,13 +5469,31 @@
             // 修复：若选中了装饰气泡图片（如五角星/云朵），将其作为气泡底图贴在文字框下方并跟随移动/缩放
             if (bubbleImage) {
                 fabric.Image.fromURL(bubbleImage, function(bgImg) {
+                    // 图片 URL 失效时 Fabric 可能回调空对象。过去此时边框层又被
+                    // 禁用，编辑器里就只剩可选中的文字，形成“气泡黏在背景上”的假象。
+                    if (!bgImg) {
+                        if (bubble.borderRef) {
+                            bubble.borderRef.set({
+                                fill: '#ffffff', stroke: opts.borderColor || '#222222',
+                                strokeWidth: opts.borderWidth || 2,
+                                selectable: true, evented: true,
+                                hasControls: true, hasBorders: true
+                            });
+                            window.editorCanvas.requestRenderAll();
+                        }
+                        return;
+                    }
                     bgImg.set({
                         // 气泡底图本身是独立可编辑对象；文字框与它可以分别拖动。
+                        originX: 'left', originY: 'top',
                         selectable: true,
                         evented: true,
+                        perPixelTargetFind: false,
+                        padding: 8,
                         hasControls: true,
                         hasBorders: true,
-                        cornerColor: '#FF6B6B',
+                        cornerColor: '#F44336',
+                        borderColor: '#F44336',
                         cornerSize: 8,
                         transparentCorners: false,
                         lockMovementX: false, lockMovementY: false,
@@ -5406,15 +5533,24 @@
                 top: bubble.previewBoxHeight ? bubble.previewBoxTop : bubble.top - 3,
                 width: bubble.previewBoxWidth || (bubble.width + 6),
                 height: bubble.previewBoxHeight || (textHeight + 6),
-                fill: 'transparent',
-                stroke: bubbleImage ? 'transparent' : (opts.borderColor || '#4A90D9'),
+                // 无图片样式同样建立独立的气泡底层：点击空白处选中红框，
+                // 点击字才选中蓝框。图片样式则由 bgImg 承担这个底层。
+                // 使用几乎透明而非完全透明的填充，避免部分 Fabric 版本对透明
+                // 对象跳过命中检测；视觉上不改变装饰气泡图片。
+                fill: bubbleImage ? 'rgba(0,0,0,0.001)' : ((opts.backgroundColor && opts.backgroundColor !== 'rgba(0,0,0,0)' && opts.backgroundColor !== 'transparent') ? opts.backgroundColor : '#ffffff'),
+                stroke: bubbleImage ? 'transparent' : ((opts.borderColor && opts.borderColor !== 'transparent') ? opts.borderColor : '#222222'),
                 strokeWidth: bubbleImage ? 0 : (opts.borderWidth || 2),
-                // 没有气泡图片时，该边框就是独立可拖动的气泡框。
+                // 这个矩形永远是气泡的“可点击外壳”。装饰图片气泡的图片层
+                // 位于它下方；这样无论图片是否带透明区、是否刚加载完成，点击
+                // 气泡空白处都一定选中红框，而不会只选中上面的文字。
                 selectable: true,
                 evented: true,
-                hasControls: !bubbleImage,
-                hasBorders: !bubbleImage,
-                cornerColor: '#FF6B6B',
+                hasControls: true,
+                hasBorders: true,
+                perPixelTargetFind: false,
+                padding: 10,
+                cornerColor: '#F44336',
+                borderColor: '#F44336',
                 cornerSize: 8,
                 transparentCorners: false,
                 lockMovementX: false,
@@ -5430,7 +5566,29 @@
             window.editorCanvas.sendToBack(borderRect);
 
             borderRect.bubbleRef = bubble;
+            borderRect.isBubbleBackground = true;
             bubble.borderRef = borderRect;
+
+            // 图片气泡的红框由 borderRect 接管。移动/缩放红框时，将真正的
+            // 装饰气泡图片同步到同一位置与尺寸；文字对象不参与同步，仍可单独
+            // 用蓝框移动。这是“气泡和文字独立编辑”的关键。
+            const syncBubbleImageFromShell = () => {
+                const bgImg = bubble.bubbleBgImg;
+                if (!bgImg || !bgImg.width || !bgImg.height) return;
+                const shellWidth = borderRect.getScaledWidth();
+                const shellHeight = borderRect.getScaledHeight();
+                bgImg.set({
+                    left: borderRect.left,
+                    top: borderRect.top,
+                    scaleX: shellWidth / bgImg.width,
+                    scaleY: shellHeight / bgImg.height
+                });
+                bgImg.setCoords();
+                window.editorCanvas.requestRenderAll();
+            };
+            borderRect.on('moving', syncBubbleImageFromShell);
+            borderRect.on('scaling', syncBubbleImageFromShell);
+            borderRect.on('modified', syncBubbleImageFromShell);
 
             const updateBorder = () => {
                 if (bubble.borderRef) {
@@ -5563,18 +5721,15 @@
             let obj = canvas.getActiveObject();
             if (!obj) return;
             
-            if (obj.type === 'rect' && obj.bubbleRef) {
-                obj = obj.bubbleRef;
-            }
-            
-            if (obj.type !== 'textbox') return;
-            
             const bgColor = document.getElementById('editBgColor').value;
-            
-            obj.set({
-                backgroundColor: bgColor,
-                strokeWidth: 0
-            });
+            const bubble = (obj.type === 'rect' && obj.bubbleRef) ? obj.bubbleRef : obj;
+            if (bubble.type !== 'textbox') return;
+
+            // 颜色属于气泡底层，不属于文字层；保持文字框透明、蓝框独立。
+            const bubbleLayer = bubble.bubbleBgImg || bubble.borderRef;
+            if (bubbleLayer && !bubble.bubbleBgImg) {
+                bubbleLayer.set({ fill: bgColor });
+            }
             
             canvas.renderAll();
         }
@@ -5832,13 +5987,31 @@
                     ? imgHeight / canvas.height : 1;
                 const bubbles = [];
                 canvas.getObjects('textbox').forEach(obj => {
+                    // 文字与气泡底图是两个独立对象。用底图的几何信息作为气泡
+                    // 位置、用 Textbox 的几何信息作为文字位置，下一次打开时仍可
+                    // 分别选择/拖动，而不是把二者重新黏回同一个框。
+                    const bubbleLayer = obj.bubbleBgImg || obj.borderRef;
+                    const bubbleLeft = bubbleLayer ? bubbleLayer.left : (obj.previewBoxLeft !== null && obj.previewBoxLeft !== undefined ? obj.previewBoxLeft : obj.left);
+                    const bubbleTop = bubbleLayer ? bubbleLayer.top : (obj.previewBoxTop !== null && obj.previewBoxTop !== undefined ? obj.previewBoxTop : (obj.top - (obj.previewTextOffsetY || 0)));
+                    const bubbleWidth = bubbleLayer && bubbleLayer.getScaledWidth ? bubbleLayer.getScaledWidth() : (obj.previewBoxWidth || obj.width) * (obj.scaleX || 1);
+                    const bubbleHeight = bubbleLayer && bubbleLayer.getScaledHeight ? bubbleLayer.getScaledHeight() : (obj.previewBoxHeight || obj.height) * (obj.scaleY || 1);
                     bubbles.push({
+                        // 先完整保留生成时的气泡样式，再覆盖成这一次用户实际
+                        // 编辑后的文字、位置和字体。这样不同任务之间互不借用样式。
+                        ...(obj.sourceBubbleMeta || {}),
                         text: obj.text || '',
                         bubbleImage: obj.bubbleBgImg ? obj.bubbleBgImg.src : '',
-                        x: parseFloat(obj.previewBoxLeft !== null && obj.previewBoxLeft !== undefined ? obj.previewBoxLeft : obj.left) * scaleX,
-                        y: parseFloat(obj.previewBoxTop !== null && obj.previewBoxTop !== undefined ? obj.previewBoxTop : (obj.top - (obj.previewTextOffsetY || 0))) * scaleY,
-                        width: parseFloat(obj.previewBoxWidth || obj.width) * (obj.scaleX || 1) * scaleX,
-                        height: parseFloat(obj.previewBoxHeight || obj.height) * (obj.scaleY || 1) * scaleY,
+                        x: parseFloat(bubbleLeft) * scaleX,
+                        y: parseFloat(bubbleTop) * scaleY,
+                        width: parseFloat(bubbleWidth) * scaleX,
+                        height: parseFloat(bubbleHeight) * scaleY,
+                        bubble_x: parseFloat(bubbleLeft) * scaleX,
+                        bubble_y: parseFloat(bubbleTop) * scaleY,
+                        bubble_width: parseFloat(bubbleWidth) * scaleX,
+                        bubble_height: parseFloat(bubbleHeight) * scaleY,
+                        text_x: parseFloat(obj.left || 0) * scaleX,
+                        text_y: parseFloat(obj.top || 0) * scaleY,
+                        text_width: parseFloat(obj.getScaledWidth ? obj.getScaledWidth() : obj.width) * scaleX,
                         fontSize: obj.logicalFontSize || ((obj.fontSize || 18) * scaleY),
                         padding: obj.logicalPadding !== undefined ? obj.logicalPadding : 10,
                         line_height: (obj.lineHeight || 1.16) * (obj.logicalFontSize || ((obj.fontSize || 18) * scaleY)),
@@ -5850,9 +6023,9 @@
                         fontWeight: obj.fontWeight || 'normal',
                         fontStyle: obj.fontStyle || 'normal',
                         underline: obj.underline || false,
-                        backgroundColor: obj.backgroundColor || '#ffffff',
-                        borderColor: obj.borderColor || '#4A90D9',
-                        borderWidth: obj.borderWidth || 2,
+                        backgroundColor: (obj.borderRef && obj.borderRef.fill) || obj.backgroundColor || '#ffffff',
+                        borderColor: (obj.borderRef && obj.borderRef.stroke) || obj.borderColor || '#222222',
+                        borderWidth: (obj.borderRef && obj.borderRef.strokeWidth) || obj.borderWidth || 2,
                         radius: obj.rx || 10
                     });
                 });
@@ -5903,6 +6076,8 @@
 
                 const formData = new FormData();
                 formData.append('panel_index', editIndex);
+                // 后端据此给编辑成图分配任务专属文件名，避免不同任务同格互相覆盖。
+                formData.append('task_id', currentTaskId || '');
                 formData.append('image_data', dataURL);
                 formData.append('bubbles', JSON.stringify(bubbles));
 
@@ -6024,17 +6199,8 @@
                 }
             });
 
-            // 输入时立即维持每行 11 字以内；这样双击后和保存后的内容一致。
-            input.addEventListener('input', function() {
-                const before = this.value;
-                const cursor = this.selectionStart;
-                const wrapped = autoWrapDialogue(before, bubble.maxCharsPerLine || 11);
-                if (wrapped !== before) {
-                    this.value = wrapped;
-                    const nextCursor = Math.min(wrapped.length, cursor + Math.max(0, wrapped.length - before.length));
-                    this.setSelectionRange(nextCursor, nextCursor);
-                }
-            });
+            // 双击编辑时保持用户看到的预览换行，也允许用户自行增删/换行。
+            // 11 字仅是生成剧本时的建议，不应在这里强制把文本重新切碎。
             
             input.addEventListener('blur', function() {
                 finishBubbleEdit(true);
@@ -6053,12 +6219,8 @@
             const canvas = window.editorCanvas;
             
             if (save) {
-                // 保留用户主动换行，同时确保每行最多 11 个字符；后端将直接
-                // 使用这份换行文本重新渲染，因此预览、编辑器与导出保持一致。
-                const newText = autoWrapDialogue(
-                    window.currentEditingInput.value.trim(),
-                    bubble.maxCharsPerLine || 11
-                );
+                // 保留用户主动换行；不要在保存时重新施加“每行 11 字”的硬限制。
+                const newText = window.currentEditingInput.value.trim();
                 if (!newText) {
                     // 文本框被清空：连同边框一起删除该气泡，避免残留空边框
                     if (bubble.borderRef) {
@@ -6237,17 +6399,28 @@
 
     <script>
     /* ============ 侧边栏：用户登录 + 任务保存/恢复 ============ */
+    async function parseTaskResponse(response){
+      try {
+        const payload=await response.json();
+        return payload && typeof payload==='object'
+          ? payload
+          : {success:false,error:'任务服务返回了无效响应'};
+      } catch(error) {
+        return {success:false,error:'任务保存服务暂时不可用（HTTP '+response.status+'），请稍后重试'};
+      }
+    }
     const TaskAPI = {
-      async me(){ try { return await (await fetch('/api/me')).json(); } catch(e){ return {success:false}; } },
-      async register(work_id, name){ const r = await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_id,name})}); return r.json(); },
-      async login(work_id, name){ const r = await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_id,name})}); return r.json(); },
-      async logout(){ const r = await fetch('/api/logout',{method:'POST'}); return r.json(); },
-      async list(){ const r = await fetch('/api/tasks'); return r.json(); },
-      async create(title, data){ const r = await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,data})}); return r.json(); },
-      async update(id, patch){ const r = await fetch('/api/tasks/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}); return r.json(); },
-      async remove(id){ const r = await fetch('/api/tasks/'+id,{method:'DELETE'}); return r.json(); },
-      async getSections(){ const r = await fetch('/api/task-sections'); return r.json(); },
-      async saveSections(sections){ const r = await fetch('/api/task-sections',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({sections})}); return r.json(); }
+      async me(){ try { return await parseTaskResponse(await fetch('/api/me')); } catch(e){ return {success:false}; } },
+      async register(work_id, name){ return parseTaskResponse(await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_id,name})})); },
+      async login(work_id, name){ return parseTaskResponse(await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_id,name})})); },
+      async logout(){ return parseTaskResponse(await fetch('/api/logout',{method:'POST'})); },
+      async list(){ return parseTaskResponse(await fetch('/api/tasks')); },
+      async create(title, data){ return parseTaskResponse(await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,data})})); },
+      async update(id, patch){ return parseTaskResponse(await fetch('/api/tasks/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)})); },
+      async reorder(task_ids){ return parseTaskResponse(await fetch('/api/tasks/order',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task_ids})})); },
+      async remove(id){ return parseTaskResponse(await fetch('/api/tasks/'+id,{method:'DELETE'})); },
+      async getSections(){ return parseTaskResponse(await fetch('/api/task-sections')); },
+      async saveSections(sections){ return parseTaskResponse(await fetch('/api/task-sections',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({sections})})); }
     };
     let allTasks = [];
 
@@ -6336,43 +6509,97 @@
     }
     function renderTaskItem(t,isPinned){
       const div=document.createElement('div');
-      div.className='task-item';
+      div.className='task-item'+(String(t.id)===String(currentTaskId)?' task-item-active':'');
+      div.dataset.taskId=String(t.id);
+      // 整张卡片均可打开任务；置顶、删除和“移到节”等操作自身会阻止冒泡，不会误触发切换。
+      div.addEventListener('click', function(){ openTask(t.id); });
       const title=t.title||'未命名任务';
       const date=(t.updated_at||'').slice(0,10);
-      div.innerHTML='<div class="task-item-title" title="'+escapeHtml(title)+'" onclick="openTask('+t.id+')">'+escapeHtml(title)+'</div>'
+      div.innerHTML='<div class="task-item-title" title="'+escapeHtml(title)+'">'+escapeHtml(title)+'</div>'
         +'<div class="task-item-meta">'+escapeHtml(date)+'</div>'
         +'<div class="task-item-actions">'
-        +'<span class="task-action" onclick="togglePin('+t.id+','+(isPinned?0:1)+')">'+(isPinned?'取消置顶':'置顶')+'</span>'
-        +'<span class="task-action task-del" onclick="deleteTask('+t.id+')">删除</span></div>';
+        +'<span class="task-action" title="上移" onclick="event.stopPropagation();moveTaskPosition('+t.id+',-1)">↑ 上移</span>'
+        +'<span class="task-action" title="下移" onclick="event.stopPropagation();moveTaskPosition('+t.id+',1)">↓ 下移</span>'
+        +'<span class="task-action" onclick="event.stopPropagation();togglePin('+t.id+','+(isPinned?0:1)+')">'+(isPinned?'取消置顶':'置顶')+'</span>'
+        +'<span class="task-action task-del" onclick="event.stopPropagation();deleteTask('+t.id+')">删除</span></div>';
       // 置顶任务固定展示在「📌 置顶任务」区、不参与节分组，故只给普通任务加「移到节」
       if(!isPinned){ div.appendChild(buildTaskMoveSelect(t)); }
       return div;
     }
+    // 不必等待任务的异步恢复完成，用户一点击就立刻知道当前正在打开哪一项。
+    function markActiveTaskItem(taskId){
+      document.querySelectorAll('.task-item[data-task-id]').forEach(function(item){
+        item.classList.toggle('task-item-active', String(item.dataset.taskId)===String(taskId));
+      });
+    }
+    async function persistTaskOrder(){
+      const res=await TaskAPI.reorder(allTasks.map(function(task){ return task.id; }));
+      if(!res.success){ throw new Error(res.error||'任务排序保存失败'); }
+    }
+    async function moveTaskPosition(taskId, direction){
+      const index=allTasks.findIndex(function(task){ return task.id===taskId; });
+      const target=index+direction;
+      if(index<0 || target<0 || target>=allTasks.length || !!allTasks[index].pinned!==!!allTasks[target].pinned){ return; }
+      const moved=allTasks[index]; allTasks[index]=allTasks[target]; allTasks[target]=moved;
+      try { await persistTaskOrder(); await loadTasks(); }
+      catch(error){ showError(error.message||'任务排序保存失败'); await loadTasks(); }
+    }
+    function taskNaturalOrder(a,b){
+      const parse=function(title){
+        const raw=String(title||''); const number=raw.match(/(?:L)?(\d{2,})/i);
+        return {number:number?Number(number[1]):Number.MAX_SAFE_INTEGER, phase:raw.includes('课前')?0:(raw.includes('课后')?1:2)};
+      };
+      const left=parse(a.title), right=parse(b.title);
+      return (left.number-right.number)||(left.phase-right.phase)||String(a.title||'').localeCompare(String(b.title||''),'zh-CN',{numeric:true});
+    }
+    async function sortTasksByTitle(direction){
+      const multiplier=direction==='desc'?-1:1;
+      const pinned=allTasks.filter(function(task){ return task.pinned; }).sort(function(a,b){ return multiplier*taskNaturalOrder(a,b); });
+      const normal=allTasks.filter(function(task){ return !task.pinned; }).sort(function(a,b){ return multiplier*taskNaturalOrder(a,b); });
+      allTasks=pinned.concat(normal);
+      try { await persistTaskOrder(); await loadTasks(); showSuccess(direction==='desc'?'任务已按数字降序排列':'任务已按数字升序排列'); }
+      catch(error){ showError(error.message||'任务排序保存失败'); await loadTasks(); }
+    }
     async function openTask(id){
       const t=allTasks.find(x=>x.id===id);
       if(!t){ return; }
+      const restoreVersion=++taskRestoreVersion;
       currentTaskId=id;   // 绑定到打开的任务，重新生成时更新而非新建
-      await restoreTask(t.data, t.title);
-      showSuccess('已打开任务：'+t.title);
+      markActiveTaskItem(id);
+      await restoreTask(t.data, t.title, restoreVersion);
+      // 用户如果在异步恢复期间又点开了另一个任务，旧任务不能再报“打开成功”，
+      // 更不能把旧任务的数据当作当前任务显示。
+      if(restoreVersion===taskRestoreVersion && currentTaskId===id){
+        showSuccess('已打开任务：'+t.title);
+      }
     }
-    async function restoreTask(data, taskTitle=''){
+    function cloneTaskData(data){
+      // TaskAPI.list() 返回的对象会保留在 allTasks 中供侧栏使用。恢复时若直接引用，
+      // 编辑全局数组就会原地改写该缓存，随后切换任务容易出现“串格/串漫画”。
+      try { return JSON.parse(JSON.stringify(data || {})); }
+      catch(e) { console.warn('任务快照深拷贝失败，使用空快照', e); return {}; }
+    }
+    async function restoreTask(data, taskTitle='', restoreVersion=taskRestoreVersion){
       if(!data){ return; }
-      currentScript = data.currentScript || null;
-      generatedCharacters = data.generatedCharacters || {};
-      generatedBackgrounds = data.generatedBackgrounds || {};
-      characterPoses = data.characterPoses || {};
-      currentLayoutConfig = data.currentLayoutConfig || null;
-      currentSelectedTemplate = data.currentSelectedTemplate || null;
-      currentComics = data.panels || [];
+      const snapshot=cloneTaskData(data);
+      if(restoreVersion!==taskRestoreVersion){ return; }
+      // 先重置，再从同一份深拷贝快照恢复。不能用 || 保留任何上一任务的缓存。
+      currentScript = snapshot.currentScript || null;
+      generatedCharacters = snapshot.generatedCharacters || {};
+      generatedBackgrounds = snapshot.generatedBackgrounds || {};
+      characterPoses = snapshot.characterPoses || {};
+      currentLayoutConfig = snapshot.currentLayoutConfig || null;
+      currentSelectedTemplate = snapshot.currentSelectedTemplate || null;
+      currentComics = Array.isArray(snapshot.panels) ? snapshot.panels : [];
       // 任务级「节」：快照里冗余的 taskSectionId 用于换浏览器/清缓存后兜底恢复归属，
       // 仅当该任务当前未分组且目标节仍存在时才生效，不覆盖用户后来的调整。
-      if(data.taskSectionId && typeof adoptTaskSectionId==='function'){
-        adoptTaskSectionId(currentTaskId, data.taskSectionId);
+      if(snapshot.taskSectionId && typeof adoptTaskSectionId==='function'){
+        adoptTaskSectionId(currentTaskId, snapshot.taskSectionId);
       }
       // 旧任务可能只保存了数据库标题；新任务则优先使用快照中的漫画标题。
       // 先缓存，等 goToStep4 完成后再写回，避免步骤渲染重置输入框。
-      const restoredTitle = (typeof data.comicTitle === 'string' && data.comicTitle.trim())
-        ? data.comicTitle.trim()
+      const restoredTitle = (typeof snapshot.comicTitle === 'string' && snapshot.comicTitle.trim())
+        ? snapshot.comicTitle.trim()
         : ((taskTitle || (currentScript && currentScript.title) || '').trim());
       if(currentScript){
         const cf=document.getElementById('characterForms'); if(cf) cf.innerHTML='';
@@ -6386,9 +6613,12 @@
       }
       renderComicPreview();
       if(typeof goToStep4==='function'){ await goToStep4(); }
+      // goToStep4 内部会等待布局模板加载；等待期间若已切换任务，旧任务到此
+      // 为止直接终止，避免标题/布局提示写进刚打开的任务。
+      if(restoreVersion!==taskRestoreVersion){ return; }
       if(restoredTitle){ const ct=document.getElementById('comicTitle'); if(ct) ct.value=restoredTitle; }
-      if(Array.isArray(data.layoutPrompts)){
-        data.layoutPrompts.forEach((p,i)=>{ const el=document.getElementById('layoutPrompt'+i); if(el) el.value=p; });
+      if(Array.isArray(snapshot.layoutPrompts)){
+        snapshot.layoutPrompts.forEach((p,i)=>{ const el=document.getElementById('layoutPrompt'+i); if(el) el.value=p; });
       }
       const cp=document.getElementById('comicPreview'); if(cp) cp.style.display='block';
       window.scrollTo({top:0,behavior:'smooth'});
