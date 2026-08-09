@@ -13781,6 +13781,29 @@ def api_logout():
     return jsonify({'success': True})
 
 
+@app.route('/api/profile', methods=['PUT'])
+def api_update_profile():
+    """允许已登录用户用当前密码修正自己的姓名。"""
+    user = get_current_user()
+    if not user:
+        return jsonify({'success': False, 'error': '请先登录'}), 401
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('name') or '').strip()
+    current_password = str(data.get('current_password') or '')
+    if not name or not current_password:
+        return jsonify({'success': False, 'error': '姓名和当前密码不能为空'}), 400
+    conn = get_db_conn()
+    try:
+        row = conn.execute('SELECT password_hash FROM users WHERE id=?', (user['id'],)).fetchone()
+        if not row or not row['password_hash'] or not check_password_hash(row['password_hash'], current_password):
+            return jsonify({'success': False, 'error': '当前密码错误'}), 403
+        conn.execute('UPDATE users SET name=? WHERE id=?', (name, user['id']))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({'success': True, 'message': '姓名已更新'})
+
+
 @app.route('/api/password/reset', methods=['POST'])
 def api_password_reset():
     data = request.get_json(silent=True) or {}
