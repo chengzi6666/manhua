@@ -10824,8 +10824,12 @@ def api_export_video_share():
         if is_railway:
             public_url = url_for('permanent_video_share_page', share_id=share_id, _external=True)
             video_url = url_for('permanent_video_share_media', share_id=share_id, _external=True)
-            share_mode = 'railway_persistent'
-            share_notice = '永久链接已保存到 Railway 持久化存储。'
+            has_volume = bool(os.environ.get('RAILWAY_VOLUME_MOUNT_PATH'))
+            share_mode = 'railway_persistent' if has_volume else 'railway_ephemeral'
+            share_notice = (
+                '永久链接已保存到 Railway 持久化存储。' if has_volume else
+                '固定链接已生成，但 Railway 尚未挂载持久化 Volume，重新部署后文件可能丢失。'
+            )
         else:
             public_base = start_temporary_video_share(deploy_dir, share_id)
             public_url = public_base + '/'
