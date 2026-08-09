@@ -28,12 +28,17 @@ import math
 import json
 import socket
 import subprocess
+import hashlib
+import base64
+from contextvars import ContextVar, copy_context
 from datetime import datetime
 import time
 import concurrent.futures
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, redirect, url_for, session, abort
+from flask import Flask, render_template, request, jsonify, send_file, send_from_directory, redirect, url_for, session, abort, has_request_context
 from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+from cryptography.fernet import Fernet, InvalidToken
 
 import sys
 
@@ -75,8 +80,27 @@ import requests
 
 app = Flask(__name__)
 CORS(app)
-# 用户与会话：使用 Flask 自带签名 session（无密码登录，仅工号+姓名）
+# 用户与会话：签名 Cookie 只保存用户 ID 与会话版本，不保存密码或 API Key。
 app.secret_key = os.environ.get('COMIC_SECRET_KEY', 'd3a7f1c2b9e8450a7c6f2d1e8b4a3c5f7e9d0a1b2c3f4e5d6c7b8a9f0e1d2c3')
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=bool(os.environ.get('RAILWAY_ENVIRONMENT')),
+)
+
+
+def _redact_log_secrets(value):
+    """递归隐藏请求日志中的密码、恢复信息和各种 API Key。"""
+    sensitive_tokens = ('password', 'api_key', 'apikey', 'secret', 'token', 'authorization')
+    if isinstance(value, dict):
+        return {
+            key: ('[REDACTED]' if any(token in str(key).lower() for token in sensitive_tokens)
+                  else _redact_log_secrets(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_log_secrets(item) for item in value]
+    return value
 
 @app.before_request
 def log_request():
@@ -90,7 +114,7 @@ def log_request():
         if request.method in ['POST', 'PUT', 'PATCH']:
             content_type = request.content_type or ''
             if 'application/json' in content_type:
-                data = request.get_json(silent=True) or {}
+                data = _redact_log_secrets(request.get_json(silent=True) or {})
                 body_summary = json.dumps(data, ensure_ascii=False)[:500]
             else:
                 body_summary = f"Content-Type: {content_type}, length: {request.content_length or 0}"
@@ -245,11 +269,41 @@ if OCR_BAIDU_AVAILABLE:
 else:
     logger.warning("百度OCR API未配置（可选）")
 
-ARK_API_KEY = os.environ.get('ARK_API_KEY', '')
+SERVER_ARK_API_KEY = os.environ.get('ARK_API_KEY', '')
 DOUBAO_MODEL_ID = os.environ.get('DOUBAO_MODEL_ID', 'doubao-seed-evolving')
 # 图像生成与文本模型分开配置。ARK_IMAGE_MODEL 可在 .env 中覆盖，默认使用已开通的 Seedream 5.0 lite。
 ARK_IMAGE_MODEL = os.environ.get('ARK_IMAGE_MODEL', 'doubao-seedream-5-0-lite-260128').strip()
-OCR_DOUBAO_AVAILABLE = bool(ARK_API_KEY)
+_request_ark_key = ContextVar('request_ark_key', default=None)
+
+
+class UserScopedArkKey:
+    """兼容旧调用点的用户级密钥代理，避免并发请求之间串用 API Key。"""
+    def value(self):
+        contextual = _request_ark_key.get()
+        if contextual is not None:
+            return contextual
+        if has_request_context():
+            uid = session.get('user_id')
+            if uid:
+                try:
+                    return get_user_ark_api_key(uid) or ''
+                except Exception as exc:
+                    logger.warning(f'[user-api-key] 读取当前用户密钥失败: {exc}')
+                    return ''
+            # Railway 公网环境不允许匿名用户借用服务器公共密钥。
+            if os.environ.get('RAILWAY_ENVIRONMENT'):
+                return ''
+        return SERVER_ARK_API_KEY
+
+    def __str__(self):
+        return self.value()
+
+    def __bool__(self):
+        return bool(self.value())
+
+
+ARK_API_KEY = UserScopedArkKey()
+OCR_DOUBAO_AVAILABLE = ARK_API_KEY
 
 if OCR_DOUBAO_AVAILABLE:
     logger.info(f"豆包API已配置，模型: {DOUBAO_MODEL_ID}")
@@ -7059,7 +7113,12 @@ def extract_text_from_scanned_pdf(pdf_path):
         else:
             # Tesseract是线程安全的，可以并行执行
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {executor.submit(ocr_page, i): i for i in range(max_pages)}
+                # ContextVar 默认不会自动传入线程池；逐页复制上下文，确保 OCR 使用
+                # 发起请求的用户密钥，而不是其他账号或服务器全局密钥。
+                futures = {
+                    executor.submit(copy_context().run, ocr_page, i): i
+                    for i in range(max_pages)
+                }
                 
                 for future in concurrent.futures.as_completed(futures):
                     result = future.result()
@@ -13481,8 +13540,38 @@ def api_client_log():
 # ===================== 用户与任务系统（工号+姓名登录，SQLite） =====================
 import sqlite3
 
-DB_DIR = os.path.join(app.root_path, 'data')
+DB_DIR = os.path.normpath(os.environ.get('APP_DATA_DIR') or os.path.join(app.root_path, 'data'))
 DB_PATH = os.path.join(DB_DIR, 'app.db')
+PASSWORD_RESET_ATTEMPTS = {}
+
+
+def _credential_cipher():
+    """获取用户凭证加密器；Railway 必须显式配置独立主密钥。"""
+    configured = os.environ.get('USER_SECRET_ENCRYPTION_KEY', '').strip()
+    if configured:
+        try:
+            return Fernet(configured.encode('ascii'))
+        except (ValueError, TypeError):
+            raise RuntimeError('USER_SECRET_ENCRYPTION_KEY 配置无效')
+    if os.environ.get('RAILWAY_ENVIRONMENT'):
+        raise RuntimeError('Railway 尚未配置用户凭证加密主密钥')
+    # 仅供本地开发兼容；生产环境不会走到这里。
+    material = hashlib.sha256(app.config['SECRET_KEY'].encode('utf-8')).digest()
+    return Fernet(base64.urlsafe_b64encode(material))
+
+
+def encrypt_user_secret(value):
+    return _credential_cipher().encrypt(str(value).encode('utf-8')).decode('ascii')
+
+
+def decrypt_user_secret(value):
+    if not value:
+        return ''
+    try:
+        return _credential_cipher().decrypt(str(value).encode('ascii')).decode('utf-8')
+    except InvalidToken:
+        logger.error('[user-api-key] 用户凭证无法解密，可能是主密钥发生变化')
+        return ''
 
 def get_db_conn():
     os.makedirs(DB_DIR, exist_ok=True)
@@ -13497,8 +13586,21 @@ def init_user_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             work_id TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
+            password_hash TEXT,
+            auth_version INTEGER NOT NULL DEFAULT 0,
+            ark_api_key_encrypted TEXT,
+            ark_api_key_last4 TEXT,
             created_at TEXT NOT NULL
         )''')
+        user_columns = {row['name'] for row in conn.execute('PRAGMA table_info(users)').fetchall()}
+        for column, definition in (
+            ('password_hash', 'TEXT'),
+            ('auth_version', 'INTEGER NOT NULL DEFAULT 0'),
+            ('ark_api_key_encrypted', 'TEXT'),
+            ('ark_api_key_last4', 'TEXT'),
+        ):
+            if column not in user_columns:
+                conn.execute(f'ALTER TABLE users ADD COLUMN {column} {definition}')
         conn.execute('''CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -13534,18 +13636,77 @@ def init_user_db():
 
 init_user_db()
 
+
+def get_user_ark_api_key(user_id):
+    conn = get_db_conn()
+    try:
+        row = conn.execute('SELECT ark_api_key_encrypted FROM users WHERE id=?', (user_id,)).fetchone()
+    finally:
+        conn.close()
+    return decrypt_user_secret(row['ark_api_key_encrypted']) if row else ''
+
+
+AI_KEY_REQUIRED_PATHS = {
+    '/analyze-content', '/generate-story-plan', '/generate-panel-script', '/generate',
+    '/generate-script', '/process-file/', '/api/extract_pdf', '/api/regenerate_script',
+    '/api/text_input', '/api/generate_backgrounds', '/api/regenerate_background',
+    '/api/regenerate_panel', '/api/generate_character_image', '/api/generate_background',
+    '/api/generate_all_backgrounds', '/api/generate_comic_from_script', '/api/analyze_emotion',
+}
+
+
+@app.before_request
+def bind_user_api_key_to_request():
+    """验证会话并绑定当前用户密钥；公网 AI 功能必须登录且完成绑定。"""
+    uid = session.get('user_id')
+    api_key = ''
+    valid_user = False
+    if uid:
+        conn = get_db_conn()
+        try:
+            row = conn.execute('''SELECT auth_version, ark_api_key_encrypted
+                                  FROM users WHERE id=?''', (uid,)).fetchone()
+        finally:
+            conn.close()
+        valid_user = bool(
+            row and int(session.get('auth_version', -1)) == int(row['auth_version'] or 0)
+        )
+        if valid_user:
+            api_key = decrypt_user_secret(row['ark_api_key_encrypted'])
+        else:
+            session.pop('user_id', None)
+            session.pop('auth_version', None)
+    _request_ark_key.set(api_key)
+
+    needs_ark_key = any(
+        request.path == path or (path.endswith('/') and request.path.startswith(path))
+        for path in AI_KEY_REQUIRED_PATHS
+    )
+    if (os.environ.get('RAILWAY_ENVIRONMENT') and request.method == 'POST' and needs_ark_key):
+        if not valid_user:
+            return jsonify({'success': False, 'error': '请先登录账号'}), 401
+        if not api_key:
+            return jsonify({'success': False, 'error': '请先在左侧账号区域绑定豆包 API Key'}), 428
+
 def get_current_user():
     uid = session.get('user_id')
     if not uid:
         return None
     conn = get_db_conn()
     try:
-        row = conn.execute('SELECT id, work_id, name, created_at FROM users WHERE id=?', (uid,)).fetchone()
+        row = conn.execute('''SELECT id, work_id, name, created_at, auth_version,
+                              ark_api_key_last4 FROM users WHERE id=?''', (uid,)).fetchone()
     finally:
         conn.close()
     if not row:
         return None
-    return {'id': row['id'], 'work_id': row['work_id'], 'name': row['name'], 'created_at': row['created_at']}
+    if int(session.get('auth_version', -1)) != int(row['auth_version'] or 0):
+        session.pop('user_id', None)
+        session.pop('auth_version', None)
+        return None
+    return {'id': row['id'], 'work_id': row['work_id'], 'name': row['name'],
+            'created_at': row['created_at'], 'ark_key_configured': bool(row['ark_api_key_last4']),
+            'ark_key_last4': row['ark_api_key_last4'] or ''}
 
 def _now():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -13556,20 +13717,27 @@ def api_register():
         data = request.get_json(force=True, silent=True) or {}
         work_id = (data.get('work_id') or '').strip()
         name = (data.get('name') or '').strip()
-        if not work_id or not name:
-            return jsonify({'success': False, 'error': '工号和姓名都不能为空'}), 400
+        password = str(data.get('password') or '')
+        if not work_id or not name or not password:
+            return jsonify({'success': False, 'error': '工号、姓名和密码都不能为空'}), 400
+        if len(password) < 6:
+            return jsonify({'success': False, 'error': '密码至少需要 6 位'}), 400
         conn = get_db_conn()
         try:
             existing = conn.execute('SELECT id FROM users WHERE work_id=?', (work_id,)).fetchone()
             if existing:
                 return jsonify({'success': False, 'error': '该工号已注册，请直接登录'}), 409
             now = _now()
-            cur = conn.execute('INSERT INTO users (work_id, name, created_at) VALUES (?,?,?)', (work_id, name, now))
+            cur = conn.execute('''INSERT INTO users
+                (work_id, name, password_hash, created_at)
+                VALUES (?,?,?,?)''',
+                (work_id, name, generate_password_hash(password), now))
             uid = cur.lastrowid
             conn.commit()
         finally:
             conn.close()
         session['user_id'] = uid
+        session['auth_version'] = 0
         return jsonify({'success': True, 'user': {'id': uid, 'work_id': work_id, 'name': name}})
     except Exception as e:
         logger.error(f"注册失败: {e}")
@@ -13581,19 +13749,26 @@ def api_login():
         data = request.get_json(force=True, silent=True) or {}
         work_id = (data.get('work_id') or '').strip()
         name = (data.get('name') or '').strip()
-        if not work_id or not name:
-            return jsonify({'success': False, 'error': '工号和姓名都不能为空'}), 400
+        password = str(data.get('password') or '')
+        if not work_id or not name or not password:
+            return jsonify({'success': False, 'error': '工号、姓名和密码都不能为空'}), 400
         conn = get_db_conn()
         try:
-            row = conn.execute('SELECT id, work_id, name FROM users WHERE work_id=?', (work_id,)).fetchone()
+            row = conn.execute('''SELECT id, work_id, name, password_hash, auth_version
+                                  FROM users WHERE work_id=?''', (work_id,)).fetchone()
             if not row:
                 return jsonify({'success': False, 'error': '工号未注册，请先注册'}), 404
             if row['name'] != name:
                 return jsonify({'success': False, 'error': '姓名与注册信息不符'}), 403
+            if not row['password_hash']:
+                return jsonify({'success': False, 'error': '旧账号尚未设置密码，请联系管理员迁移'}), 403
+            if not check_password_hash(row['password_hash'], password):
+                return jsonify({'success': False, 'error': '密码错误'}), 403
             uid = row['id']
         finally:
             conn.close()
         session['user_id'] = uid
+        session['auth_version'] = int(row['auth_version'] or 0)
         return jsonify({'success': True, 'user': {'id': uid, 'work_id': row['work_id'], 'name': row['name']}})
     except Exception as e:
         logger.error(f"登录失败: {e}")
@@ -13602,7 +13777,70 @@ def api_login():
 @app.route('/api/logout', methods=['POST'])
 def api_logout():
     session.pop('user_id', None)
+    session.pop('auth_version', None)
     return jsonify({'success': True})
+
+
+@app.route('/api/password/reset', methods=['POST'])
+def api_password_reset():
+    data = request.get_json(silent=True) or {}
+    work_id = str(data.get('work_id') or '').strip()
+    name = str(data.get('name') or '').strip()
+    new_password = str(data.get('new_password') or '')
+    if not work_id or not name or len(new_password) < 6:
+        return jsonify({'success': False, 'error': '请填写工号、姓名和至少 6 位的新密码'}), 400
+    attempt_key = (request.remote_addr or 'unknown', work_id)
+    now_ts = time.time()
+    recent = [ts for ts in PASSWORD_RESET_ATTEMPTS.get(attempt_key, []) if now_ts - ts < 600]
+    if len(recent) >= 5:
+        return jsonify({'success': False, 'error': '尝试次数过多，请 10 分钟后再试'}), 429
+    recent.append(now_ts)
+    PASSWORD_RESET_ATTEMPTS[attempt_key] = recent
+    conn = get_db_conn()
+    try:
+        row = conn.execute('SELECT id, name FROM users WHERE work_id=?', (work_id,)).fetchone()
+        if not row or row['name'] != name:
+            return jsonify({'success': False, 'error': '工号或姓名不正确'}), 403
+        conn.execute('''UPDATE users SET password_hash=?, auth_version=auth_version+1
+                        WHERE id=?''', (generate_password_hash(new_password), row['id']))
+        conn.commit()
+    finally:
+        conn.close()
+    PASSWORD_RESET_ATTEMPTS.pop(attempt_key, None)
+    return jsonify({'success': True, 'message': '密码已重置，请重新登录'})
+
+
+@app.route('/api/ark-key', methods=['GET', 'PUT', 'DELETE'])
+def api_user_ark_key():
+    user = get_current_user()
+    if not user:
+        return jsonify({'success': False, 'error': '请先登录'}), 401
+    if request.method == 'GET':
+        return jsonify({'success': True, 'configured': user['ark_key_configured'],
+                        'last4': user['ark_key_last4']})
+    conn = get_db_conn()
+    try:
+        if request.method == 'DELETE':
+            conn.execute('''UPDATE users SET ark_api_key_encrypted=NULL,
+                            ark_api_key_last4=NULL WHERE id=?''', (user['id'],))
+            conn.commit()
+            _request_ark_key.set('')
+            return jsonify({'success': True, 'message': '豆包 API Key 已解除绑定'})
+
+        api_key = str((request.get_json(silent=True) or {}).get('api_key') or '').strip()
+        if len(api_key) < 16 or re.search(r'\s', api_key):
+            return jsonify({'success': False, 'error': 'API Key 格式不正确'}), 400
+        encrypted = encrypt_user_secret(api_key)
+        conn.execute('''UPDATE users SET ark_api_key_encrypted=?, ark_api_key_last4=?
+                        WHERE id=?''', (encrypted, api_key[-4:], user['id']))
+        conn.commit()
+        _request_ark_key.set(api_key)
+        return jsonify({'success': True, 'configured': True, 'last4': api_key[-4:],
+                        'message': '豆包 API Key 已加密保存'})
+    except RuntimeError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 503
+    finally:
+        conn.close()
 
 @app.route('/api/me', methods=['GET'])
 def api_me():

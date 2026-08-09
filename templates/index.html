@@ -6411,9 +6411,13 @@
     }
     const TaskAPI = {
       async me(){ try { return await parseTaskResponse(await fetch('/api/me')); } catch(e){ return {success:false}; } },
-      async register(work_id, name){ return parseTaskResponse(await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_id,name})})); },
-      async login(work_id, name){ return parseTaskResponse(await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_id,name})})); },
+      async register(work_id, name, password){ return parseTaskResponse(await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_id,name,password})})); },
+      async login(work_id, name, password){ return parseTaskResponse(await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_id,name,password})})); },
       async logout(){ return parseTaskResponse(await fetch('/api/logout',{method:'POST'})); },
+      async resetPassword(work_id,name,new_password){ return parseTaskResponse(await fetch('/api/password/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_id,name,new_password})})); },
+      async arkStatus(){ return parseTaskResponse(await fetch('/api/ark-key')); },
+      async bindArkKey(api_key){ return parseTaskResponse(await fetch('/api/ark-key',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key})})); },
+      async removeArkKey(){ return parseTaskResponse(await fetch('/api/ark-key',{method:'DELETE'})); },
       async list(){ return parseTaskResponse(await fetch('/api/tasks')); },
       async create(title, data){ return parseTaskResponse(await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,data})})); },
       async update(id, patch){ return parseTaskResponse(await fetch('/api/tasks/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)})); },
@@ -6427,38 +6431,71 @@
     function renderLoginSection(user){
       const el = document.getElementById('loginSection');
       if(user){
+        const arkStatus=user.ark_key_configured
+          ? '<span style="color:#54c487">已绑定 ····'+escapeHtml(user.ark_key_last4)+'</span>'
+          : '<span style="color:#ffb45c">尚未绑定</span>';
         el.innerHTML = '<div class="sidebar-section-title">👤 个人登录</div>'
           + '<div class="login-user"><div class="login-name">'+escapeHtml(user.name)+'</div>'
           + '<div class="login-workid">工号：'+escapeHtml(user.work_id)+'</div></div>'
+          + '<div style="font-size:.78rem;margin:6px 0">豆包 API：'+arkStatus+'</div>'
+          + '<div style="display:flex;gap:6px;margin-bottom:7px">'
+          + '<button class="sidebar-btn" onclick="bindArkApiKey()">'+(user.ark_key_configured?'更新密钥':'绑定密钥')+'</button>'
+          + (user.ark_key_configured?'<button class="sidebar-btn sidebar-btn-ghost" onclick="removeArkApiKey()">解除</button>':'')+'</div>'
+          + '<a href="https://console.volcengine.com/ark" target="_blank" rel="noopener" style="font-size:.76rem;color:#79b8ff">注册/开通豆包 API 指引 ↗</a>'
           + '<button class="sidebar-btn" style="width:100%" onclick="doLogout()">退出登录</button>';
       } else {
         el.innerHTML = '<div class="sidebar-section-title">👤 个人登录</div>'
           + '<input id="loginWorkId" class="sidebar-input" placeholder="工号">'
           + '<input id="loginName" class="sidebar-input" placeholder="姓名">'
+          + '<input id="loginPassword" class="sidebar-input" type="password" placeholder="密码（至少6位）">'
           + '<div style="display:flex;gap:6px;margin-top:6px;">'
           + '<button class="sidebar-btn" onclick="doLogin()">登录</button>'
           + '<button class="sidebar-btn sidebar-btn-ghost" onclick="doRegister()">注册</button></div>'
+          + '<button class="sidebar-btn sidebar-btn-ghost" style="width:100%;margin-top:6px" onclick="doResetPassword()">忘记密码（工号＋姓名找回）</button>'
           + '<div id="loginMsg" class="sidebar-msg"></div>';
       }
     }
     async function doLogin(){
       const work_id=document.getElementById('loginWorkId').value.trim();
       const name=document.getElementById('loginName').value.trim();
+      const password=document.getElementById('loginPassword').value;
       const msg=document.getElementById('loginMsg'); msg.textContent='';
-      const res=await TaskAPI.login(work_id,name);
+      const res=await TaskAPI.login(work_id,name,password);
       if(res.success){ await initSidebar(); showSuccess('登录成功'); }
       else { msg.textContent=res.error||'登录失败'; }
     }
     async function doRegister(){
       const work_id=document.getElementById('loginWorkId').value.trim();
       const name=document.getElementById('loginName').value.trim();
+      const password=document.getElementById('loginPassword').value;
       const msg=document.getElementById('loginMsg'); msg.textContent='';
-      const res=await TaskAPI.register(work_id,name);
+      const res=await TaskAPI.register(work_id,name,password);
       if(res.success){ await initSidebar(); showSuccess('注册并登录成功'); }
       else { msg.textContent=res.error||'注册失败'; }
     }
     async function doLogout(){
       await TaskAPI.logout(); await initSidebar(); showSuccess('已退出登录');
+    }
+    async function doResetPassword(){
+      const work_id=prompt('请输入注册工号：'); if(!work_id) return;
+      const name=prompt('请输入注册姓名：'); if(!name) return;
+      const new_password=prompt('请输入新密码（至少6位）：'); if(!new_password) return;
+      const res=await TaskAPI.resetPassword(work_id.trim(),name.trim(),new_password);
+      if(res.success) showSuccess('密码已重置，请使用新密码登录');
+      else showError(res.error||'密码重置失败');
+    }
+    async function bindArkApiKey(){
+      const api_key=prompt('请粘贴火山方舟 API Key。密钥会在服务器加密保存，页面不会再次显示完整内容：');
+      if(!api_key) return;
+      const res=await TaskAPI.bindArkKey(api_key.trim());
+      if(res.success){ showSuccess(res.message||'豆包 API Key 已绑定'); await initSidebar(); }
+      else showError(res.error||'绑定失败');
+    }
+    async function removeArkApiKey(){
+      if(!confirm('确认解除当前账号的豆包 API Key？')) return;
+      const res=await TaskAPI.removeArkKey();
+      if(res.success){ showSuccess('已解除绑定'); await initSidebar(); }
+      else showError(res.error||'解除失败');
     }
     async function initSidebar(){
       const me=await TaskAPI.me();

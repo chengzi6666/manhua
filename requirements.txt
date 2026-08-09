@@ -12,6 +12,7 @@ gunicorn==21.2.0
 PyPDF2==3.0.1
 python-dotenv==1.0.0
 werkzeug==2.3.7
+cryptography==41.0.7
 flask-cors==4.0.0
 python-docx==1.1.0
 python-pptx==1.0.2
