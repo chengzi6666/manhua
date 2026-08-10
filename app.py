@@ -2360,7 +2360,12 @@ def generate_image_openai_compatible(prompt, index, width, height, config):
     model = config.get('model') or ('gpt-image-1' if provider == 'openai' else '')
     # OpenAI image models accept a documented set of square/landscape/portrait sizes.
     ratio = float(width or 1) / max(1.0, float(height or 1))
-    if provider == 'openai':
+    if provider == 'tal':
+        if 'seedream-5' in str(model or '').lower():
+            size = _tal_image_size(model, width, height)
+        else:
+            size = '1536x1024' if ratio > 1.12 else ('1024x1536' if ratio < 0.89 else '1024x1024')
+    elif provider == 'openai':
         size = '1536x1024' if ratio > 1.12 else ('1024x1536' if ratio < 0.89 else '1024x1024')
     else:
         size = f'{int(width)}x{int(height)}'
@@ -2373,8 +2378,7 @@ def generate_image_openai_compatible(prompt, index, width, height, config):
             url = _validate_custom_image_url(url)
         response = requests.post(
             url,
-            headers={'Authorization': f"Bearer {config.get('api_key')}",
-                     'Content-Type': 'application/json'},
+            headers=_image_provider_headers(config),
             json=body, timeout=180,
         )
         if response.status_code >= 400:
@@ -14010,12 +14014,18 @@ IMAGE_PROVIDER_DEFAULTS = {
         'base_url': 'https://api.openai.com/v1/images/generations',
         'model': 'gpt-image-1',
     },
+    'tal': {
+        'label': '好未来星图（公司 Token）',
+        'base_url': 'http://ai-service.tal.com/openai-compatible/v1/images/generations',
+        'model': 'doubao-seedream-5-0-lite',
+    },
     'custom': {
         'label': '自定义 OpenAI 兼容接口',
         'base_url': '',
         'model': '',
     },
 }
+IMAGE_PROVIDER_TEST_ATTEMPTS = {}
 
 
 def _validate_public_https_url(raw_url):
@@ -14051,6 +14061,162 @@ def _validate_custom_image_url(raw_url):
     return value
 
 
+def _image_provider_config_from_payload(body, saved_config=None):
+    """Validate provider settings for save/test without persisting plaintext secrets."""
+    body = body or {}
+    provider = str(body.get('provider') or '').strip().lower()
+    if provider not in IMAGE_PROVIDER_DEFAULTS:
+        raise ValueError('不支持的生图服务商')
+    saved_config = saved_config or {}
+    api_key = str(body.get('api_key') or '').strip()
+    if not api_key and saved_config.get('provider') == provider:
+        api_key = str(saved_config.get('api_key') or '').strip()
+    if len(api_key) < 16 or re.search(r'\s', api_key):
+        raise ValueError('API Key 格式不正确')
+    defaults = IMAGE_PROVIDER_DEFAULTS[provider]
+    model = str(body.get('model') or defaults['model']).strip()
+    if not model or len(model) > 120:
+        raise ValueError('模型名称不能为空或过长')
+    base_url = defaults['base_url']
+    if provider == 'custom':
+        base_url = _validate_custom_image_url(body.get('base_url') or saved_config.get('base_url'))
+    return {'provider': provider, 'api_key': api_key, 'model': model, 'base_url': base_url}
+
+
+def _image_provider_headers(config):
+    """The TAL gateway uses api-key; other compatible APIs use Bearer auth."""
+    if config.get('provider') == 'tal':
+        return {'api-key': config['api_key'], 'Content-Type': 'application/json'}
+    return {'Authorization': f"Bearer {config['api_key']}", 'Content-Type': 'application/json'}
+
+
+def _tal_image_size(model, width, height):
+    """Normalize TAL sizes with headroom above Seedream 5's 3,686,400-pixel floor."""
+    model_name = str(model or '').lower()
+    requested_width = max(1, int(width or 1024))
+    requested_height = max(1, int(height or 1024))
+    if 'seedream-5' in model_name or 'seedream-5-0' in model_name:
+        # Do not sit exactly on the provider boundary: the TAL proxy/backend may
+        # round dimensions internally. 4,194,304 gives a stable 2048x2048 square.
+        min_pixels = 4_194_304
+        if requested_width * requested_height < min_pixels:
+            scale = math.sqrt(min_pixels / (requested_width * requested_height))
+            requested_width = int(math.ceil(requested_width * scale / 8) * 8)
+            requested_height = int(math.ceil(requested_height * scale / 8) * 8)
+    return f'{requested_width}x{requested_height}'
+
+
+def _image_api_error(response):
+    """Turn common provider errors into a useful user-facing diagnosis."""
+    status = int(getattr(response, 'status_code', 0) or 0)
+    detail = ''
+    request_id = ''
+    try:
+        payload = response.json()
+        error = payload.get('error') or payload.get('message') or payload.get('code') or ''
+        request_id = str(payload.get('request_id') or payload.get('requestId') or '')
+        if isinstance(error, dict):
+            detail = str(error.get('message') or error.get('code') or '')
+            request_id = request_id or str(error.get('request_id') or error.get('requestId') or '')
+        else:
+            detail = str(error)
+    except Exception:
+        detail = str(getattr(response, 'text', '') or '')[:300]
+    if status in (401, 403):
+        reason = 'API Key 无效，或该密钥没有调用此模型的权限'
+    elif status == 404:
+        reason = '接口地址或模型名称不存在'
+    elif status == 429:
+        reason = '调用频率、余额或额度受限'
+    elif status >= 500:
+        reason = f'公司模型网关或上游模型暂时不可用（HTTP {status}）'
+    else:
+        reason = f'服务商拒绝请求（HTTP {status}）'
+    if not request_id:
+        for header_name in ('x-request-id', 'x-tt-logid', 'request-id', 'trace-id', 'x-trace-id'):
+            request_id = str(getattr(response, 'headers', {}).get(header_name, '') or '')
+            if request_id:
+                break
+    suffix = f'：{detail[:240]}' if detail else ''
+    if request_id:
+        suffix += f'（请求编号：{request_id[:120]}）'
+    return reason + suffix
+
+
+def test_image_provider_connection(config):
+    """Generate one minimal image. This is the only reliable cross-provider capability test."""
+    provider = config['provider']
+    prompt = 'A simple blue circle centered on a plain white background, no text.'
+    headers = _image_provider_headers(config)
+    started = time.time()
+    if provider == 'aliyun':
+        body = {'model': config['model'], 'input': {'prompt': prompt},
+                'parameters': {'n': 1, 'size': '1024*1024'}}
+        response = requests.post(config['base_url'], headers={**headers, 'X-DashScope-Async': 'enable'},
+                                 json=body, timeout=45)
+        if response.status_code != 200:
+            raise ValueError(_image_api_error(response))
+        task_id = (response.json().get('output') or {}).get('task_id')
+        if not task_id:
+            raise ValueError('阿里云已响应，但没有返回生图任务编号')
+        image_bytes = _poll_tongyi_task(task_id, config['api_key'], max_wait=120)
+        if not image_bytes:
+            raise ValueError('密钥和模型已接受请求，但测试图片生成失败；请检查余额、模型权限或稍后再试')
+    else:
+        if provider == 'doubao':
+            body = {'model': config['model'], 'prompt': prompt, 'size': '1920x1920', 'n': 1,
+                    'response_format': 'url', 'watermark': False,
+                    'sequential_image_generation': 'disabled'}
+        elif provider == 'tal':
+            body = {'model': config['model'], 'prompt': prompt,
+                    'size': _tal_image_size(config['model'], 1024, 1024), 'n': 1,
+                    'response_format': 'url'}
+        else:
+            body = {'model': config['model'], 'prompt': prompt, 'size': '1024x1024', 'n': 1}
+        url = _validate_custom_image_url(config['base_url']) if provider == 'custom' else config['base_url']
+        response = requests.post(url, headers=headers, json=body, timeout=180)
+        if response.status_code >= 400:
+            logger.warning(
+                '[image-provider-test] provider=%s model=%s status=%s diagnostic=%s',
+                provider, config['model'], response.status_code, _image_api_error(response)
+            )
+            raise ValueError(_image_api_error(response))
+        image_bytes = _download_or_decode_generated_image(
+            response.json(), require_public_url=(provider == 'custom'))
+        if not image_bytes:
+            raise ValueError('接口调用成功，但返回内容中没有可识别的图片 URL 或 Base64 数据')
+    return {'elapsed_ms': int((time.time() - started) * 1000), 'bytes': len(image_bytes)}
+
+
+@app.route('/api/image-provider/test', methods=['POST'])
+def api_test_image_provider():
+    user = get_current_user()
+    if not user:
+        return jsonify({'success': False, 'error': '请先登录'}), 401
+    now_ts = time.time()
+    recent = [ts for ts in IMAGE_PROVIDER_TEST_ATTEMPTS.get(user['id'], []) if now_ts - ts < 600]
+    if len(recent) >= 5:
+        return jsonify({'success': False, 'error': '测试次数过多，请 10 分钟后再试'}), 429
+    recent.append(now_ts)
+    IMAGE_PROVIDER_TEST_ATTEMPTS[user['id']] = recent
+    try:
+        config = _image_provider_config_from_payload(
+            request.get_json(silent=True) or {}, get_request_image_provider())
+        result = test_image_provider_connection(config)
+        return jsonify({'success': True, 'provider': config['provider'], 'model': config['model'],
+                        'elapsed_ms': result['elapsed_ms'],
+                        'message': '测试成功：API Key 可以调用该生图模型'})
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except requests.Timeout:
+        return jsonify({'success': False, 'error': '测试超时：服务商响应过慢，请稍后再试'}), 504
+    except requests.RequestException as exc:
+        return jsonify({'success': False, 'error': f'无法连接服务商：{str(exc)[:240]}'}), 502
+    except Exception as exc:
+        logger.exception('[image-provider-test] unexpected failure')
+        return jsonify({'success': False, 'error': f'测试失败：{str(exc)[:240]}'}), 500
+
+
 @app.route('/api/image-provider', methods=['GET', 'PUT', 'DELETE'])
 def api_image_provider():
     """Per-user encrypted image API settings, independent between accounts."""
@@ -14083,23 +14249,10 @@ def api_image_provider():
             _request_image_provider.set(None)
             return jsonify({'success': True, 'message': '生图服务配置已解除'})
 
-        body = request.get_json(silent=True) or {}
-        provider = str(body.get('provider') or '').strip().lower()
-        if provider not in IMAGE_PROVIDER_DEFAULTS:
-            return jsonify({'success': False, 'error': '不支持的生图服务商'}), 400
-        api_key = str(body.get('api_key') or '').strip()
-        if len(api_key) < 16 or re.search(r'\s', api_key):
-            return jsonify({'success': False, 'error': 'API Key 格式不正确'}), 400
+        config = _image_provider_config_from_payload(request.get_json(silent=True) or {})
+        provider, api_key = config['provider'], config['api_key']
+        model, base_url = config['model'], config['base_url']
         defaults = IMAGE_PROVIDER_DEFAULTS[provider]
-        model = str(body.get('model') or defaults['model']).strip()
-        if not model or len(model) > 120:
-            return jsonify({'success': False, 'error': '模型名称不能为空或过长'}), 400
-        base_url = defaults['base_url']
-        if provider == 'custom':
-            try:
-                base_url = _validate_custom_image_url(body.get('base_url'))
-            except ValueError as exc:
-                return jsonify({'success': False, 'error': str(exc)}), 400
         encrypted = encrypt_user_secret(api_key)
         conn.execute('''UPDATE users SET image_provider=?, image_api_key_encrypted=?,
                         image_api_key_last4=?, image_base_url=?, image_model=? WHERE id=?''',
@@ -14109,6 +14262,8 @@ def api_image_provider():
                                      'base_url': base_url, 'model': model})
         return jsonify({'success': True, 'configured': True, 'provider': provider,
                         'last4': api_key[-4:], 'message': f"{defaults['label']}生图服务已加密保存"})
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
     except RuntimeError as exc:
         return jsonify({'success': False, 'error': str(exc)}), 503
     finally:

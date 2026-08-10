@@ -6436,6 +6436,7 @@
       async removeArkKey(){ return parseTaskResponse(await fetch('/api/ark-key',{method:'DELETE'})); },
       async imageProviderStatus(){ return parseTaskResponse(await fetch('/api/image-provider')); },
       async saveImageProvider(settings){ return parseTaskResponse(await fetch('/api/image-provider',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)})); },
+      async testImageProvider(settings){ return parseTaskResponse(await fetch('/api/image-provider/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)})); },
       async removeImageProvider(){ return parseTaskResponse(await fetch('/api/image-provider',{method:'DELETE'})); },
       async list(){ return parseTaskResponse(await fetch('/api/tasks')); },
       async create(title, data){ return parseTaskResponse(await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,data})})); },
@@ -6450,7 +6451,7 @@
     function renderLoginSection(user){
       const el = document.getElementById('loginSection');
       if(user){
-        const providerNames={doubao:'豆包',aliyun:'阿里云百炼',openai:'OpenAI',custom:'自定义兼容'};
+        const providerNames={doubao:'豆包',aliyun:'阿里云百炼',openai:'OpenAI',tal:'好未来星图',custom:'自定义兼容'};
         const arkStatus=user.image_key_configured
           ? '<span style="color:#54c487">'+escapeHtml(providerNames[user.image_provider]||user.image_provider||'已配置')+' ····'+escapeHtml(user.image_key_last4)+'</span>'
           : '<span style="color:#ffb45c">尚未绑定</span>';
@@ -6529,11 +6530,13 @@
     }
     function updateImageProviderFields(){
       const provider=document.getElementById('imageProviderSelect').value;
-      const defaults={doubao:'doubao-seedream-5-0-lite-260128',aliyun:'wanx2.1-t2i-turbo',openai:'gpt-image-1',custom:''};
+      const defaults={doubao:'doubao-seedream-5-0-lite-260128',aliyun:'wanx2.1-t2i-turbo',openai:'gpt-image-1',tal:'doubao-seedream-5-0-lite',custom:''};
       const model=document.getElementById('imageProviderModel');
       const custom=document.getElementById('imageProviderCustomUrl');
+      const talHint=document.getElementById('imageProviderTalHint');
       if(!model.dataset.edited) model.value=defaults[provider]||'';
       custom.closest('.ark-guide-step').style.display=provider==='custom'?'block':'none';
+      if(talHint) talHint.style.display=provider==='tal'?'block':'none';
     }
     async function openImageProviderSettings(){
       closeImageProviderSettings();
@@ -6545,17 +6548,21 @@
         <div class="ark-guide-body">
           <div class="ark-guide-callout"><b>每个账号独立配置。</b>API Key 会加密保存，其他用户无法读取。自定义接口需兼容 OpenAI 的 <code>/images/generations</code> 请求和返回格式。</div>
           <div class="ark-guide-step"><h3>1. 服务商</h3><select id="imageProviderSelect" class="sidebar-input" style="color:#263044;background:#fff;width:100%" onchange="document.getElementById('imageProviderModel').dataset.edited='';updateImageProviderFields()">
-            <option value="doubao">豆包（火山方舟）</option><option value="aliyun">阿里云百炼（通义万相）</option><option value="openai">OpenAI</option><option value="custom">自定义 OpenAI 兼容接口</option>
+            <option value="doubao">豆包（火山方舟）</option><option value="aliyun">阿里云百炼（通义万相）</option><option value="openai">OpenAI</option><option value="tal">好未来星图（公司 Token）</option><option value="custom">自定义 OpenAI 兼容接口</option>
           </select></div>
+          <div id="imageProviderTalHint" class="ark-guide-callout" style="display:none"><b>公司接口专用：</b>请填写星图平台提供的 <code>APP_ID:APP_KEY</code>，系统会自动使用公司要求的 <code>api-key</code> 请求头和固定生图地址。不要填写 <code>/claw</code> 地址。</div>
           <div class="ark-guide-step"><h3>2. API Key</h3><input id="imageProviderKey" type="password" class="sidebar-input" style="color:#263044;background:#fff;width:100%" placeholder="粘贴完整 API Key（保存后不再显示）"><p style="font-size:.82rem;color:#697086">${status.configured?'当前已配置 ····'+escapeHtml(status.last4)+'；若更换设置，请重新填写完整密钥。':'尚未配置密钥。'}</p></div>
-          <div class="ark-guide-step"><h3>3. 模型名称</h3><input id="imageProviderModel" class="sidebar-input" style="color:#263044;background:#fff;width:100%" oninput="this.dataset.edited='1'" placeholder="模型 ID"></div>
+          <div class="ark-guide-step"><h3>3. 模型名称</h3><input id="imageProviderModel" list="imageProviderModels" class="sidebar-input" style="color:#263044;background:#fff;width:100%" oninput="this.dataset.edited='1'" placeholder="模型 ID"><datalist id="imageProviderModels"><option value="doubao-seedream-5-0-lite"><option value="doubao-seedream-4.0"><option value="doubao-seedream-3-0-t2i"><option value="gpt-image-1"><option value="gpt-image-1-mini"><option value="volcengine-visual"></datalist><p style="font-size:.82rem;color:#697086">公司平台请填写账号已经绑定的模型 ID；你的账号当前使用 <code>doubao-seedream-5-0-lite</code>。</p></div>
           <div class="ark-guide-step" style="display:none"><h3>4. 自定义接口地址</h3><input id="imageProviderCustomUrl" class="sidebar-input" style="color:#263044;background:#fff;width:100%" placeholder="https://你的域名/v1"><p style="font-size:.82rem;color:#697086">可以填写 API 根地址或完整的 /images/generations 地址；只允许公网 HTTPS。</p></div>
-          <div class="ark-guide-actions"><button class="ark-guide-primary" onclick="saveImageProviderSettings()">保存生图服务</button><button class="ark-guide-secondary" onclick="closeImageProviderSettings()">取消</button></div>
+          <div id="imageProviderTestResult" style="display:none;margin-top:12px;padding:11px 13px;border-radius:9px;line-height:1.6"></div>
+          <div class="ark-guide-actions"><button id="imageProviderTestButton" class="ark-guide-secondary" onclick="testImageProviderSettings()">🧪 测试连接</button><button class="ark-guide-primary" onclick="saveImageProviderSettings()">保存生图服务</button><button class="ark-guide-secondary" onclick="closeImageProviderSettings()">取消</button></div>
+          <p style="font-size:.78rem;color:#7a8194;margin-top:10px">“测试连接”会真实生成一张简单测试图，因此可能产生一次生图费用；测试图不会保存。</p>
         </div></div>`;
       document.body.appendChild(overlay);
       const provider=status.provider||'doubao'; document.getElementById('imageProviderSelect').value=provider;
       document.getElementById('imageProviderModel').value=status.model||'';
       document.getElementById('imageProviderCustomUrl').value=status.base_url||'';
+      document.getElementById('imageProviderTestResult').dataset.hasSavedKey=status.configured?'1':'';
       updateImageProviderFields();
       overlay.addEventListener('click',event=>{if(event.target===overlay) closeImageProviderSettings();});
     }
@@ -6568,6 +6575,41 @@
       const result=await TaskAPI.saveImageProvider({provider,api_key,model,base_url});
       if(!result.success){ showError(result.error||'保存失败'); return; }
       closeImageProviderSettings(); showSuccess(result.message||'生图服务已保存'); await initSidebar();
+    }
+    function currentImageProviderForm(){
+      return {
+        provider:document.getElementById('imageProviderSelect').value,
+        api_key:document.getElementById('imageProviderKey').value.trim(),
+        model:document.getElementById('imageProviderModel').value.trim(),
+        base_url:document.getElementById('imageProviderCustomUrl').value.trim()
+      };
+    }
+    async function testImageProviderSettings(){
+      const settings=currentImageProviderForm();
+      const resultBox=document.getElementById('imageProviderTestResult');
+      const button=document.getElementById('imageProviderTestButton');
+      if(!settings.api_key && !String(resultBox.dataset.hasSavedKey||'')){
+        showError('请先填写完整 API Key'); return;
+      }
+      if(!confirm('测试会真实调用一次生图模型，可能产生一次图片生成费用。是否继续？')) return;
+      button.disabled=true; button.textContent='⏳ 正在调用模型…';
+      resultBox.style.display='block'; resultBox.style.background='#eef2ff'; resultBox.style.color='#4b587a';
+      resultBox.textContent='正在验证密钥、模型权限和图片返回格式，请稍候…';
+      try{
+        const result=await TaskAPI.testImageProvider(settings);
+        if(result.success){
+          resultBox.style.background='#e7f8ee'; resultBox.style.color='#247447';
+          resultBox.textContent='✅ '+(result.message||'测试成功')+'（'+Math.max(1,Math.round((result.elapsed_ms||0)/1000))+' 秒）';
+        }else{
+          resultBox.style.background='#fff0f0'; resultBox.style.color='#b43b3b';
+          resultBox.textContent='❌ '+(result.error||'测试失败');
+        }
+      }catch(error){
+        resultBox.style.background='#fff0f0'; resultBox.style.color='#b43b3b';
+        resultBox.textContent='❌ 测试请求失败，请检查网络后重试';
+      }finally{
+        button.disabled=false; button.textContent='🧪 测试连接';
+      }
     }
     async function removeImageProvider(){
       if(!confirm('确认解除当前账号的生图服务配置？')) return;
