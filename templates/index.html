@@ -6434,6 +6434,9 @@
       async arkStatus(){ return parseTaskResponse(await fetch('/api/ark-key')); },
       async bindArkKey(api_key){ return parseTaskResponse(await fetch('/api/ark-key',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key})})); },
       async removeArkKey(){ return parseTaskResponse(await fetch('/api/ark-key',{method:'DELETE'})); },
+      async imageProviderStatus(){ return parseTaskResponse(await fetch('/api/image-provider')); },
+      async saveImageProvider(settings){ return parseTaskResponse(await fetch('/api/image-provider',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)})); },
+      async removeImageProvider(){ return parseTaskResponse(await fetch('/api/image-provider',{method:'DELETE'})); },
       async list(){ return parseTaskResponse(await fetch('/api/tasks')); },
       async create(title, data){ return parseTaskResponse(await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,data})})); },
       async update(id, patch){ return parseTaskResponse(await fetch('/api/tasks/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)})); },
@@ -6447,23 +6450,24 @@
     function renderLoginSection(user){
       const el = document.getElementById('loginSection');
       if(user){
-        const arkStatus=user.ark_key_configured
-          ? '<span style="color:#54c487">已绑定 ····'+escapeHtml(user.ark_key_last4)+'</span>'
+        const providerNames={doubao:'豆包',aliyun:'阿里云百炼',openai:'OpenAI',custom:'自定义兼容'};
+        const arkStatus=user.image_key_configured
+          ? '<span style="color:#54c487">'+escapeHtml(providerNames[user.image_provider]||user.image_provider||'已配置')+' ····'+escapeHtml(user.image_key_last4)+'</span>'
           : '<span style="color:#ffb45c">尚未绑定</span>';
         el.innerHTML = '<div class="sidebar-section-title">👤 个人登录</div>'
           + '<div class="login-user"><div class="login-name">'+escapeHtml(user.name)+'</div>'
           + '<div class="login-workid">工号：'+escapeHtml(user.work_id)+'</div></div>'
-          + '<div style="font-size:.78rem;margin:6px 0">豆包 API：'+arkStatus+'</div>'
+          + '<div style="font-size:.78rem;margin:6px 0">生图 API：'+arkStatus+'</div>'
           + '<div style="display:flex;gap:6px;margin-bottom:7px">'
-          + '<button class="sidebar-btn" onclick="bindArkApiKey()">'+(user.ark_key_configured?'更新密钥':'绑定密钥')+'</button>'
-          + (user.ark_key_configured?'<button class="sidebar-btn sidebar-btn-ghost" onclick="removeArkApiKey()">解除</button>':'')+'</div>'
-          + '<button class="sidebar-btn sidebar-btn-ghost" style="width:100%;margin-bottom:7px" onclick="openArkGuide()">📘 小白图文开通教程</button>'
+          + '<button class="sidebar-btn" onclick="openImageProviderSettings()">'+(user.image_key_configured?'更换服务商':'配置生图服务')+'</button>'
+          + (user.image_key_configured?'<button class="sidebar-btn sidebar-btn-ghost" onclick="removeImageProvider()">解除</button>':'')+'</div>'
+          + '<button class="sidebar-btn sidebar-btn-ghost" style="width:100%;margin-bottom:7px" onclick="openArkGuide()">📘 豆包图文开通教程</button>'
           + '<button class="sidebar-btn" style="width:100%" onclick="doLogout()">退出登录</button>';
-        if(!user.ark_key_configured){
-          const guideKey='arkGuideSeen:'+user.id;
+        if(!user.image_key_configured){
+          const guideKey='imageProviderSeen:'+user.id;
           if(!localStorage.getItem(guideKey)){
             localStorage.setItem(guideKey,'1');
-            setTimeout(openArkGuide,350);
+            setTimeout(openImageProviderSettings,350);
           }
         }
       } else {
@@ -6519,6 +6523,57 @@
       const res=await TaskAPI.removeArkKey();
       if(res.success){ showSuccess('已解除绑定'); await initSidebar(); }
       else showError(res.error||'解除失败');
+    }
+    function closeImageProviderSettings(){
+      const overlay=document.getElementById('imageProviderOverlay'); if(overlay) overlay.remove();
+    }
+    function updateImageProviderFields(){
+      const provider=document.getElementById('imageProviderSelect').value;
+      const defaults={doubao:'doubao-seedream-5-0-lite-260128',aliyun:'wanx2.1-t2i-turbo',openai:'gpt-image-1',custom:''};
+      const model=document.getElementById('imageProviderModel');
+      const custom=document.getElementById('imageProviderCustomUrl');
+      if(!model.dataset.edited) model.value=defaults[provider]||'';
+      custom.closest('.ark-guide-step').style.display=provider==='custom'?'block':'none';
+    }
+    async function openImageProviderSettings(){
+      closeImageProviderSettings();
+      const status=await TaskAPI.imageProviderStatus();
+      if(!status.success){ showError(status.error||'无法读取生图服务配置'); return; }
+      const overlay=document.createElement('div'); overlay.id='imageProviderOverlay'; overlay.className='ark-guide-overlay';
+      overlay.innerHTML=`<div class="ark-guide-modal" role="dialog" aria-modal="true" style="max-width:700px">
+        <div class="ark-guide-head"><div style="font-size:28px">🎨</div><h2>选择生图 AI 服务商</h2><button class="ark-guide-close" onclick="closeImageProviderSettings()">×</button></div>
+        <div class="ark-guide-body">
+          <div class="ark-guide-callout"><b>每个账号独立配置。</b>API Key 会加密保存，其他用户无法读取。自定义接口需兼容 OpenAI 的 <code>/images/generations</code> 请求和返回格式。</div>
+          <div class="ark-guide-step"><h3>1. 服务商</h3><select id="imageProviderSelect" class="sidebar-input" style="color:#263044;background:#fff;width:100%" onchange="document.getElementById('imageProviderModel').dataset.edited='';updateImageProviderFields()">
+            <option value="doubao">豆包（火山方舟）</option><option value="aliyun">阿里云百炼（通义万相）</option><option value="openai">OpenAI</option><option value="custom">自定义 OpenAI 兼容接口</option>
+          </select></div>
+          <div class="ark-guide-step"><h3>2. API Key</h3><input id="imageProviderKey" type="password" class="sidebar-input" style="color:#263044;background:#fff;width:100%" placeholder="粘贴完整 API Key（保存后不再显示）"><p style="font-size:.82rem;color:#697086">${status.configured?'当前已配置 ····'+escapeHtml(status.last4)+'；若更换设置，请重新填写完整密钥。':'尚未配置密钥。'}</p></div>
+          <div class="ark-guide-step"><h3>3. 模型名称</h3><input id="imageProviderModel" class="sidebar-input" style="color:#263044;background:#fff;width:100%" oninput="this.dataset.edited='1'" placeholder="模型 ID"></div>
+          <div class="ark-guide-step" style="display:none"><h3>4. 自定义接口地址</h3><input id="imageProviderCustomUrl" class="sidebar-input" style="color:#263044;background:#fff;width:100%" placeholder="https://你的域名/v1"><p style="font-size:.82rem;color:#697086">可以填写 API 根地址或完整的 /images/generations 地址；只允许公网 HTTPS。</p></div>
+          <div class="ark-guide-actions"><button class="ark-guide-primary" onclick="saveImageProviderSettings()">保存生图服务</button><button class="ark-guide-secondary" onclick="closeImageProviderSettings()">取消</button></div>
+        </div></div>`;
+      document.body.appendChild(overlay);
+      const provider=status.provider||'doubao'; document.getElementById('imageProviderSelect').value=provider;
+      document.getElementById('imageProviderModel').value=status.model||'';
+      document.getElementById('imageProviderCustomUrl').value=status.base_url||'';
+      updateImageProviderFields();
+      overlay.addEventListener('click',event=>{if(event.target===overlay) closeImageProviderSettings();});
+    }
+    async function saveImageProviderSettings(){
+      const provider=document.getElementById('imageProviderSelect').value;
+      const api_key=document.getElementById('imageProviderKey').value.trim();
+      const model=document.getElementById('imageProviderModel').value.trim();
+      const base_url=document.getElementById('imageProviderCustomUrl').value.trim();
+      if(!api_key){ showError('请填写完整 API Key'); return; }
+      const result=await TaskAPI.saveImageProvider({provider,api_key,model,base_url});
+      if(!result.success){ showError(result.error||'保存失败'); return; }
+      closeImageProviderSettings(); showSuccess(result.message||'生图服务已保存'); await initSidebar();
+    }
+    async function removeImageProvider(){
+      if(!confirm('确认解除当前账号的生图服务配置？')) return;
+      const result=await TaskAPI.removeImageProvider();
+      if(result.success){ showSuccess(result.message||'已解除'); await initSidebar(); }
+      else showError(result.error||'解除失败');
     }
     function closeArkGuide(){
       const overlay=document.getElementById('arkGuideOverlay');

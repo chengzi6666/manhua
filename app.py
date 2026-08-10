@@ -274,6 +274,7 @@ DOUBAO_MODEL_ID = os.environ.get('DOUBAO_MODEL_ID', 'doubao-seed-evolving')
 # 图像生成与文本模型分开配置。ARK_IMAGE_MODEL 可在 .env 中覆盖，默认使用已开通的 Seedream 5.0 lite。
 ARK_IMAGE_MODEL = os.environ.get('ARK_IMAGE_MODEL', 'doubao-seedream-5-0-lite-260128').strip()
 _request_ark_key = ContextVar('request_ark_key', default=None)
+_request_image_provider = ContextVar('request_image_provider', default=None)
 
 
 class UserScopedArkKey:
@@ -303,6 +304,19 @@ class UserScopedArkKey:
 
 
 ARK_API_KEY = UserScopedArkKey()
+
+
+def get_request_image_provider():
+    """Return the current user's image provider without leaking credentials."""
+    configured = _request_image_provider.get()
+    if configured:
+        return configured
+    key = str(ARK_API_KEY or '')
+    return {
+        'provider': 'doubao', 'api_key': key,
+        'model': ARK_IMAGE_MODEL,
+        'base_url': 'https://ark.cn-beijing.volces.com/api/v3/images/generations',
+    } if key else None
 OCR_DOUBAO_AVAILABLE = ARK_API_KEY
 
 if OCR_DOUBAO_AVAILABLE:
@@ -2022,8 +2036,18 @@ def generate_image(prompt, index, world_setting=None, style_seed=None, is_charac
     
     # 已配置方舟时必须优先使用用户选择的付费模型。此前免费模型在这里先返回，
     # 导致即使配置了豆包，背景仍会由不稳定的免费服务生成并与提示词不匹配。
-    if ARK_API_KEY:
-        result = generate_image_ark(base_prompt, index, is_character, width, height)
+    image_config = get_request_image_provider()
+    if image_config:
+        provider = image_config.get('provider')
+        if provider == 'doubao':
+            result = generate_image_ark(base_prompt, index, is_character, width, height, image_config)
+        elif provider == 'aliyun':
+            result = generate_image_tongyi_text(
+                base_prompt, seed=seed, width=width, height=height,
+                api_key=image_config.get('api_key'), model=image_config.get('model'))
+        else:
+            result = generate_image_openai_compatible(
+                base_prompt, index, width, height, image_config)
         if result:
             return result
         # 纯背景接口不能把生成失败伪装成“已按提示词生成”的免费结果。
@@ -2207,7 +2231,7 @@ def remove_background(image_data):
         return None
 
 
-def generate_image_ark(prompt, index, is_character=False, width=512, height=512):
+def generate_image_ark(prompt, index, is_character=False, width=512, height=512, config=None):
     """使用豆包方舟平台图片生成API"""
     max_retries = 3
     retry_delay = 2
@@ -2248,14 +2272,15 @@ def generate_image_ark(prompt, index, is_character=False, width=512, height=512)
             logger.info(f"提示词: {prompt[:200]}...")
             logger.info(f"图片尺寸: {size_str}")
             
-            url = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+            config = config or get_request_image_provider() or {}
+            url = config.get('base_url') or "https://ark.cn-beijing.volces.com/api/v3/images/generations"
             headers = {
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {ARK_API_KEY}"
+                "Authorization": f"Bearer {config.get('api_key') or ARK_API_KEY}"
             }
             
             data = {
-                "model": ARK_IMAGE_MODEL,
+                "model": config.get('model') or ARK_IMAGE_MODEL,
                 "prompt": prompt,
                 "size": size_str,
                 "n": 1,
@@ -2308,6 +2333,64 @@ def generate_image_ark(prompt, index, is_character=False, width=512, height=512)
     return None
 
 
+def _download_or_decode_generated_image(payload, require_public_url=False):
+    """Read the common OpenAI-compatible image response (URL or base64)."""
+    import base64
+    items = payload.get('data') if isinstance(payload, dict) else None
+    if not items or not isinstance(items, list):
+        return None
+    item = items[0] or {}
+    encoded = item.get('b64_json') or item.get('base64')
+    if encoded:
+        return base64.b64decode(encoded)
+    image_url = item.get('url')
+    if image_url:
+        if require_public_url:
+            image_url = _validate_public_https_url(image_url)
+        response = requests.get(image_url, timeout=60)
+        response.raise_for_status()
+        return response.content
+    return None
+
+
+def generate_image_openai_compatible(prompt, index, width, height, config):
+    """OpenAI Images API and compatible /images/generations endpoints."""
+    provider = config.get('provider') or 'custom'
+    url = config.get('base_url') or 'https://api.openai.com/v1/images/generations'
+    model = config.get('model') or ('gpt-image-1' if provider == 'openai' else '')
+    # OpenAI image models accept a documented set of square/landscape/portrait sizes.
+    ratio = float(width or 1) / max(1.0, float(height or 1))
+    if provider == 'openai':
+        size = '1536x1024' if ratio > 1.12 else ('1024x1536' if ratio < 0.89 else '1024x1024')
+    else:
+        size = f'{int(width)}x{int(height)}'
+    # Do not force response_format: modern compatible services may return either URL or b64_json.
+    # The parser below accepts both, which is more portable across gateways.
+    body = {'model': model, 'prompt': prompt, 'n': 1, 'size': size}
+    try:
+        if provider == 'custom':
+            # Revalidate on every call to reduce DNS-rebinding/changed-domain risk.
+            url = _validate_custom_image_url(url)
+        response = requests.post(
+            url,
+            headers={'Authorization': f"Bearer {config.get('api_key')}",
+                     'Content-Type': 'application/json'},
+            json=body, timeout=180,
+        )
+        if response.status_code >= 400:
+            logger.error('[image-provider:%s] HTTP %s: %s', provider,
+                         response.status_code, response.text[:500])
+        response.raise_for_status()
+        result = _download_or_decode_generated_image(
+            response.json(), require_public_url=(provider == 'custom'))
+        if result:
+            return result
+        logger.error('[image-provider:%s] 返回中没有可用图片', provider)
+    except Exception as exc:
+        logger.error('[image-provider:%s] 生图失败: %s', provider, exc)
+    return None
+
+
 def generate_image_jimeng(prompt, index, style_seed=None, is_character=False, width=768, height=768):
     """使用Pollinations.AI生图API生成图片"""
     return generate_image_pollinations(prompt, index, is_character, width, height)
@@ -2346,15 +2429,23 @@ def _poll_tongyi_task(task_id, api_key, max_wait=240):
     return None
 
 
-def generate_image_tongyi_text(prompt, seed=None, width=1024, height=1024):
+def generate_image_tongyi_text(prompt, seed=None, width=1024, height=1024,
+                               api_key=None, model='wanx2.1-t2i-turbo'):
     """通义万相文生图（wanx2.1-t2i-turbo），用于生成标准角色。返回图片 bytes 或 None。
     注意：通义万相对于中文 prompt 效果最好，调用方应直接传中文、不要翻译成英文。
     """
     import requests, base64, time
-    api_key = os.environ.get('DASHSCOPE_API_KEY')
+    api_key = api_key or os.environ.get('DASHSCOPE_API_KEY')
     if not api_key:
         return None
     try:
+        ratio = float(width or 1) / max(1.0, float(height or 1))
+        if ratio > 1.18:
+            width, height = 1280, 720
+        elif ratio < 0.85:
+            width, height = 720, 1280
+        else:
+            width, height = 1024, 1024
         url = 'https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis'
         headers = {
             'Authorization': f'Bearer {api_key}',
@@ -2364,7 +2455,7 @@ def generate_image_tongyi_text(prompt, seed=None, width=1024, height=1024):
         params = {'n': 1, 'size': f'{width}*{height}'}
         if seed is not None:
             params['seed'] = int(seed)
-        body = {'model': 'wanx2.1-t2i-turbo', 'input': {'prompt': prompt}, 'parameters': params}
+        body = {'model': model or 'wanx2.1-t2i-turbo', 'input': {'prompt': prompt}, 'parameters': params}
         r = requests.post(url, headers=headers, json=body, timeout=40)
         if r.status_code != 200:
             logger.error(f'万相文生图提交失败: HTTP {r.status_code} {r.text[:200]}')
@@ -13590,6 +13681,11 @@ def init_user_db():
             auth_version INTEGER NOT NULL DEFAULT 0,
             ark_api_key_encrypted TEXT,
             ark_api_key_last4 TEXT,
+            image_provider TEXT,
+            image_api_key_encrypted TEXT,
+            image_api_key_last4 TEXT,
+            image_base_url TEXT,
+            image_model TEXT,
             created_at TEXT NOT NULL
         )''')
         user_columns = {row['name'] for row in conn.execute('PRAGMA table_info(users)').fetchall()}
@@ -13598,6 +13694,11 @@ def init_user_db():
             ('auth_version', 'INTEGER NOT NULL DEFAULT 0'),
             ('ark_api_key_encrypted', 'TEXT'),
             ('ark_api_key_last4', 'TEXT'),
+            ('image_provider', 'TEXT'),
+            ('image_api_key_encrypted', 'TEXT'),
+            ('image_api_key_last4', 'TEXT'),
+            ('image_base_url', 'TEXT'),
+            ('image_model', 'TEXT'),
         ):
             if column not in user_columns:
                 conn.execute(f'ALTER TABLE users ADD COLUMN {column} {definition}')
@@ -13661,10 +13762,13 @@ def bind_user_api_key_to_request():
     uid = session.get('user_id')
     api_key = ''
     valid_user = False
+    _request_image_provider.set(None)
     if uid:
         conn = get_db_conn()
         try:
-            row = conn.execute('''SELECT auth_version, ark_api_key_encrypted
+            row = conn.execute('''SELECT auth_version, ark_api_key_encrypted,
+                                  image_provider, image_api_key_encrypted,
+                                  image_base_url, image_model
                                   FROM users WHERE id=?''', (uid,)).fetchone()
         finally:
             conn.close()
@@ -13673,6 +13777,24 @@ def bind_user_api_key_to_request():
         )
         if valid_user:
             api_key = decrypt_user_secret(row['ark_api_key_encrypted'])
+            image_key = decrypt_user_secret(row['image_api_key_encrypted'])
+            provider = (row['image_provider'] or '').strip().lower()
+            if provider and image_key:
+                _request_image_provider.set({
+                    'provider': provider,
+                    'api_key': image_key,
+                    'base_url': (row['image_base_url'] or '').strip(),
+                    'model': (row['image_model'] or '').strip(),
+                })
+            elif api_key:
+                # 老用户无感迁移：仍使用原豆包密钥和默认图片模型。
+                _request_image_provider.set({
+                    'provider': 'doubao', 'api_key': api_key,
+                    'base_url': 'https://ark.cn-beijing.volces.com/api/v3/images/generations',
+                    'model': ARK_IMAGE_MODEL,
+                })
+            else:
+                _request_image_provider.set(None)
         else:
             session.pop('user_id', None)
             session.pop('auth_version', None)
@@ -13685,8 +13807,8 @@ def bind_user_api_key_to_request():
     if (os.environ.get('RAILWAY_ENVIRONMENT') and request.method == 'POST' and needs_ark_key):
         if not valid_user:
             return jsonify({'success': False, 'error': '请先登录账号'}), 401
-        if not api_key:
-            return jsonify({'success': False, 'error': '请先在左侧账号区域绑定豆包 API Key'}), 428
+        if not api_key and not get_request_image_provider():
+            return jsonify({'success': False, 'error': '请先在左侧账号区域配置 AI 服务'}), 428
 
 def get_current_user():
     uid = session.get('user_id')
@@ -13695,7 +13817,8 @@ def get_current_user():
     conn = get_db_conn()
     try:
         row = conn.execute('''SELECT id, work_id, name, created_at, auth_version,
-                              ark_api_key_last4 FROM users WHERE id=?''', (uid,)).fetchone()
+                              ark_api_key_last4, image_provider, image_api_key_last4,
+                              image_base_url, image_model FROM users WHERE id=?''', (uid,)).fetchone()
     finally:
         conn.close()
     if not row:
@@ -13704,9 +13827,14 @@ def get_current_user():
         session.pop('user_id', None)
         session.pop('auth_version', None)
         return None
+    image_provider = (row['image_provider'] or ('doubao' if row['ark_api_key_last4'] else '')).strip()
+    image_last4 = row['image_api_key_last4'] or row['ark_api_key_last4'] or ''
     return {'id': row['id'], 'work_id': row['work_id'], 'name': row['name'],
             'created_at': row['created_at'], 'ark_key_configured': bool(row['ark_api_key_last4']),
-            'ark_key_last4': row['ark_api_key_last4'] or ''}
+            'ark_key_last4': row['ark_api_key_last4'] or '',
+            'image_provider': image_provider, 'image_key_configured': bool(image_last4),
+            'image_key_last4': image_last4, 'image_model': row['image_model'] or '',
+            'image_base_url': row['image_base_url'] or ''}
 
 def _now():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -13860,6 +13988,127 @@ def api_user_ark_key():
         _request_ark_key.set(api_key)
         return jsonify({'success': True, 'configured': True, 'last4': api_key[-4:],
                         'message': '豆包 API Key 已加密保存'})
+    except RuntimeError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 503
+    finally:
+        conn.close()
+
+
+IMAGE_PROVIDER_DEFAULTS = {
+    'doubao': {
+        'label': '豆包（火山方舟）',
+        'base_url': 'https://ark.cn-beijing.volces.com/api/v3/images/generations',
+        'model': ARK_IMAGE_MODEL,
+    },
+    'aliyun': {
+        'label': '阿里云百炼（通义万相）',
+        'base_url': 'https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis',
+        'model': 'wanx2.1-t2i-turbo',
+    },
+    'openai': {
+        'label': 'OpenAI',
+        'base_url': 'https://api.openai.com/v1/images/generations',
+        'model': 'gpt-image-1',
+    },
+    'custom': {
+        'label': '自定义 OpenAI 兼容接口',
+        'base_url': '',
+        'model': '',
+    },
+}
+
+
+def _validate_public_https_url(raw_url):
+    """Only allow public HTTPS URLs; block SSRF targets and embedded credentials."""
+    from urllib.parse import urlparse
+    import ipaddress
+    import socket
+    value = str(raw_url or '').strip().rstrip('/')
+    if not value:
+        raise ValueError('接口地址不能为空')
+    parsed = urlparse(value)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+            or parsed.query or parsed.fragment):
+        raise ValueError('自定义接口必须是公网 HTTPS 地址，且不能包含账号密码')
+    host = parsed.hostname.lower()
+    if host == 'localhost' or host.endswith('.local'):
+        raise ValueError('不能使用本机或内网接口地址')
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(host, parsed.port or 443)}
+        if any(ipaddress.ip_address(address).is_private or ipaddress.ip_address(address).is_loopback
+               or ipaddress.ip_address(address).is_link_local or ipaddress.ip_address(address).is_reserved
+               for address in addresses):
+            raise ValueError('不能使用本机或内网接口地址')
+    except socket.gaierror:
+        raise ValueError('自定义接口域名无法解析')
+    return value
+
+
+def _validate_custom_image_url(raw_url):
+    value = _validate_public_https_url(raw_url)
+    if not value.endswith('/images/generations'):
+        value += '/images/generations'
+    return value
+
+
+@app.route('/api/image-provider', methods=['GET', 'PUT', 'DELETE'])
+def api_image_provider():
+    """Per-user encrypted image API settings, independent between accounts."""
+    user = get_current_user()
+    if not user:
+        return jsonify({'success': False, 'error': '请先登录'}), 401
+    if request.method == 'GET':
+        providers = {key: {'label': value['label'], 'default_model': value['model'],
+                           'default_base_url': value['base_url']}
+                     for key, value in IMAGE_PROVIDER_DEFAULTS.items()}
+        return jsonify({'success': True, 'configured': user['image_key_configured'],
+                        'provider': user['image_provider'], 'last4': user['image_key_last4'],
+                        'model': user['image_model'], 'base_url': user['image_base_url'],
+                        'providers': providers})
+    conn = get_db_conn()
+    try:
+        if request.method == 'DELETE':
+            existing = conn.execute('SELECT image_provider FROM users WHERE id=?',
+                                    (user['id'],)).fetchone()
+            if existing and existing['image_provider']:
+                conn.execute('''UPDATE users SET image_provider=NULL, image_api_key_encrypted=NULL,
+                                image_api_key_last4=NULL, image_base_url=NULL, image_model=NULL
+                                WHERE id=?''', (user['id'],))
+            else:
+                # 旧版账号把豆包同时作为文字和生图密钥；解除时保持旧操作语义。
+                conn.execute('''UPDATE users SET ark_api_key_encrypted=NULL, ark_api_key_last4=NULL
+                                WHERE id=?''', (user['id'],))
+                _request_ark_key.set('')
+            conn.commit()
+            _request_image_provider.set(None)
+            return jsonify({'success': True, 'message': '生图服务配置已解除'})
+
+        body = request.get_json(silent=True) or {}
+        provider = str(body.get('provider') or '').strip().lower()
+        if provider not in IMAGE_PROVIDER_DEFAULTS:
+            return jsonify({'success': False, 'error': '不支持的生图服务商'}), 400
+        api_key = str(body.get('api_key') or '').strip()
+        if len(api_key) < 16 or re.search(r'\s', api_key):
+            return jsonify({'success': False, 'error': 'API Key 格式不正确'}), 400
+        defaults = IMAGE_PROVIDER_DEFAULTS[provider]
+        model = str(body.get('model') or defaults['model']).strip()
+        if not model or len(model) > 120:
+            return jsonify({'success': False, 'error': '模型名称不能为空或过长'}), 400
+        base_url = defaults['base_url']
+        if provider == 'custom':
+            try:
+                base_url = _validate_custom_image_url(body.get('base_url'))
+            except ValueError as exc:
+                return jsonify({'success': False, 'error': str(exc)}), 400
+        encrypted = encrypt_user_secret(api_key)
+        conn.execute('''UPDATE users SET image_provider=?, image_api_key_encrypted=?,
+                        image_api_key_last4=?, image_base_url=?, image_model=? WHERE id=?''',
+                     (provider, encrypted, api_key[-4:], base_url, model, user['id']))
+        conn.commit()
+        _request_image_provider.set({'provider': provider, 'api_key': api_key,
+                                     'base_url': base_url, 'model': model})
+        return jsonify({'success': True, 'configured': True, 'provider': provider,
+                        'last4': api_key[-4:], 'message': f"{defaults['label']}生图服务已加密保存"})
     except RuntimeError as exc:
         return jsonify({'success': False, 'error': str(exc)}), 503
     finally:
